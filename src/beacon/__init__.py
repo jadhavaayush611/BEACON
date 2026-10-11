@@ -4,6 +4,7 @@
 """
 
 from beacon.config import Settings, get_settings
+from beacon.ingestion import IngestionResult, ingest_file
 from beacon.models import (
     STANDARD_EVENT_TYPES,
     ConflictingClaim,
@@ -19,12 +20,14 @@ from beacon.models import (
     generate_source_id,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",
     "Settings",
     "get_settings",
+    "ingest_file",
+    "IngestionResult",
     "SourceType",
     "ExtractionMethod",
     "ExtractionStatus",

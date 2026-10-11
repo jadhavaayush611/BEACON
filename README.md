@@ -6,14 +6,16 @@ BEACON is a production-grade data engineering pipeline engineered to ingest hete
 
 ---
 
-## Current Status: Phase 1 (Foundation & Data Contracts)
+## Current Status: Phase 2 (Multi-Format Ingestion Completed)
 
-Phase 1 establishes the bedrock of BEACON without prematurely introducing heavy database, OCR, or orchestrator dependencies:
-- **Canonical Pydantic Data Contracts:** Strongly typed `SourceRecord`, `DisasterObservation`, and `UnifiedDisasterEvent` models with strict validation rules.
-- **Typed Configuration & Security:** Single-source-of-truth configuration via `pydantic-settings` (`src/beacon/config.py`) and log filters that scrub credentials.
-- **Deterministic Identity Schemes:** Reproducible, rerun-stable identifier generation for sources, observations, and events.
-- **Multi-Format Sample Datasets:** Synthetic JSON, CSV, TXT, PDF, and PNG sample assets with co-referent disaster incidents and missing field demonstrations.
-- **Automated Test Suite:** Comprehensive pytest verification covering model validations, configuration overrides, and sample data integrity.
+Phase 2 implements the ingestion and extraction engine for all five input formats:
+- **Central Dispatcher (`ingest_file`):** Case-insensitive extension resolution (`.json`, `.csv`, `.txt`, `.pdf`, `.png`, etc.) producing a unified `IngestionResult`.
+- **JSON Ingestor (`JsonIngestor`):** Safely deserializes structured JSON feeds, validating individual records into `DisasterObservation` and handling partial extractions.
+- **CSV Ingestor (`CsvIngestor`):** Standard library tabular parser mapping sensor rows, preserving row locators, and handling missing values without fact fabrication.
+- **TXT Ingestor (`TxtIngestor`):** Grammar-based situational text parser for delimited `[REPORT ...]` blocks with multi-line narrative extraction.
+- **PDF Ingestor (`PdfIngestor`):** Lightweight `pypdf` extractor for multi-page situation reports with page-level reference tracking.
+- **Image Ingestor (`ImageIngestor`):** `Pillow`-based raster container validation and metadata extraction, with OCR deferred to later phases.
+- **Cryptographic Provenance:** Automatic SHA-256 calculation over raw bytes and rerun-stable deterministic identifier generation.
 
 ---
 
@@ -29,7 +31,7 @@ In accordance with Python packaging best practices (`src`-layout), all applicati
 beacon/
 ├── README.md                          # Project documentation and roadmap
 ├── pyproject.toml                     # Package build configuration & pytest options
-├── requirements.txt                   # Minimal Phase 1 runtime dependencies
+├── requirements.txt                   # Phase 2 runtime dependencies
 ├── .gitignore                         # Python, venv, secret, and raw data exclusions
 ├── .env.example                       # Non-sensitive configuration template
 ├── src/
@@ -37,7 +39,18 @@ beacon/
 │       ├── __init__.py                # Package exports & public API
 │       ├── config.py                  # Single authoritative typed Settings
 │       ├── models.py                  # Pydantic models (SourceRecord, DisasterObservation, etc.)
-│       └── logging_config.py          # Secure logging setup with credential redaction
+│       ├── logging_config.py          # Secure logging setup with credential redaction
+│       └── ingestion/                 # Multi-format ingestion subsystem
+│           ├── __init__.py            # Ingestion public interface
+│           ├── base.py                # BaseIngestor abstract class & SHA-256 helpers
+│           ├── dispatcher.py          # Central ingest_file entry point & routing
+│           ├── exceptions.py          # Typed ingestion exceptions
+│           ├── result.py              # IngestionResult typed model
+│           ├── json_ingestor.py       # JSON telemetry ingestor
+│           ├── csv_ingestor.py        # CSV sensor log ingestor
+│           ├── txt_ingestor.py        # Structured text situation report ingestor
+│           ├── pdf_ingestor.py        # pypdf multi-page situation report ingestor
+│           └── image_ingestor.py      # Pillow image validator & metadata reader
 ├── data/
 │   ├── raw/
 │   │   └── .gitkeep                   # Local directory for uncommitted raw ingestion files
@@ -53,9 +66,11 @@ beacon/
 ├── tests/
 │   ├── test_models.py                 # Data contract validations & constraints
 │   ├── test_config.py                 # Configuration and logging filter tests
-│   └── test_sample_data.py            # Sample dataset integrity & co-reference tests
+│   ├── test_sample_data.py            # Sample dataset integrity & co-reference tests
+│   └── test_ingestion.py              # Multi-format ingestion, routing, and error tests
 └── docs/
-    └── data_contract.md               # Full specification of models & schemas
+    ├── data_contract.md               # Canonical data contracts specification
+    └── ingestion.md                   # Ingestion & extraction architecture guide
 ```
 
 ---
@@ -73,7 +88,7 @@ python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 ```
 
-### 2. Install Phase 1 Dependencies
+### 2. Install Dependencies
 ```powershell
 pip install -r requirements.txt
 ```
@@ -93,7 +108,27 @@ Copy-Item .env.example .env
 pytest -v
 ```
 
-All 54 tests run completely locally without requiring external APIs, PostgreSQL, or OCR binaries.
+All 92 tests run completely locally without requiring external APIs, PostgreSQL, or OCR binaries.
+
+---
+
+## Ingestion Usage Example
+
+```python
+from pathlib import Path
+from beacon import ingest_file
+
+# Ingest any supported format via the unified API
+result = ingest_file("data/sample/events.json")
+
+print(f"Status: {result.status.value}")
+print(f"Source ID: {result.source_record.source_id}")
+print(f"Content Hash: {result.source_record.content_hash}")
+print(f"Accepted Observations: {result.accepted_count}")
+
+for obs in result.observations:
+    print(f"  - [{obs.event_type}] {obs.location} @ {obs.event_time} (severity={obs.severity})")
+```
 
 ---
 
@@ -102,7 +137,7 @@ All 54 tests run completely locally without requiring external APIs, PostgreSQL,
 | Phase | Title | Focus Area | Status |
 |---|---|---|---|
 | **Phase 1** | **Foundation & Data Contracts** | Canonical Pydantic schemas, deterministic IDs, config, sample datasets, unit test suite. | **Completed** |
-| **Phase 2** | **Multi-Format Ingestion & Extraction** | Extractors for PDF (pypdf/pdfplumber), JSON, CSV, TXT (regex/NLP), and raster Image OCR (Tesseract/Vision). | Upcoming |
+| **Phase 2** | **Multi-Format Ingestion & Extraction** | Extractors for JSON, CSV, structured TXT, multi-page PDF (`pypdf`), and image validation (`Pillow`). | **Completed** |
 | **Phase 3** | **Entity Resolution & Provenance Engine** | Spatiotemporal clustering, co-reference resolution, confidence weighting, and conflict tracking. | Upcoming |
 | **Phase 4** | **Storage & Transformation Pipeline** | Relational storage (PostgreSQL), data lake ingestion, SQL transformations, and dbt models. | Upcoming |
 | **Phase 5** | **Disaster Intelligence Dashboard** | Interactive Streamlit/FastAPI UI for situation awareness, audit trails, and data profiling. | Upcoming |
