@@ -1,0 +1,32 @@
+================================================================================
+BEACON SYNTHETIC SITUATION REPORT FEED (SIMULATED DATASET)
+DISCLAIMER: ALL INCIDENTS ARE SIMULATED EXERCISE DATA FOR PIPELINE TESTING.
+================================================================================
+
+[REPORT 2026-10-12-001]
+TIMESTAMP: 2026-10-12T08:15:00Z
+LOCATION: Riverside Metro, Sector 4 Bridge Environs
+EVENT: Flash Flood
+SEVERITY: Severe
+NARRATIVE: Emergency dispatch logs record urban flood escalation along Riverside
+Metro Sector 4. Low-lying bridge access ramps are submerged by estimated 1.2 to 1.5
+meters of water. Regional response units have mobilized inflatable rescue craft.
+SOURCE_ID: TXT-SIM-201
+
+[REPORT 2026-10-12-002]
+TIMESTAMP: 2026-10-12T11:00:00Z
+LOCATION: Southern Industrial Park
+EVENT: Industrial Accident
+SEVERITY: Unknown
+NARRATIVE: Simulated chemical containment drill alarm triggered at facility warehouse
+B-4. No casualties simulated; air monitoring units deployed as cautionary protocol.
+SOURCE_ID: TXT-SIM-202
+
+[REPORT 2026-10-12-003]
+TIMESTAMP: 
+LOCATION: North Forest Perimeter
+EVENT: Wildfire
+SEVERITY: Moderate
+NARRATIVE: Controlled simulation flare ignited along perimeter firebreak to test
+drone infrared hotspot detection sensors.
+SOURCE_ID: TXT-SIM-203

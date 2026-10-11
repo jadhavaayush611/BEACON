@@ -1,0 +1,64 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>
+endobj
+4 0 obj
+<< /Length 882 >>
+stream
+BT
+/F1 18 Tf
+50 720 Td
+(BEACON SYNTHETIC SITUATION REPORT) Tj
+/F1 10 Tf
+0 -26 Td
+(DISCLAIMER: SYNTHETIC EXERCISE DATA - NOT A REAL INCIDENT) Tj
+0 -24 Td
+(Incident ID: PDF-SIM-301) Tj
+0 -18 Td
+(Event Category: Flood / Riverine Inundation) Tj
+0 -18 Td
+(Timestamp: 2026-10-12T09:00:00Z) Tj
+0 -18 Td
+(Location: Riverside Metro, Sector 4 Environs) Tj
+0 -18 Td
+(Estimated Coordinates: Lat 28.6142, Lon 77.2095) Tj
+0 -18 Td
+(Severity: Severe) Tj
+0 -28 Td
+(Incident Narrative:) Tj
+0 -18 Td
+(Aerial reconnaissance confirms severe floodwater inundation along Sector 4.) Tj
+0 -18 Td
+(River stage sensors indicate water levels have crested at 1.45 meters.) Tj
+0 -18 Td
+(Field teams report embankment breach expanding along eastern retaining wall.) Tj
+0 -24 Td
+(Cross-Reference: Co-referent to telemetry in events.json (JSON-SIM-001)) Tj
+0 -18 Td
+(and field log events.csv (CSV-SIM-101).) Tj
+ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000247 00000 n 
+0000001179 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+1249
+%%EOF

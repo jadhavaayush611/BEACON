@@ -1,0 +1,4 @@
+record_id,event_type,location,event_time,latitude,longitude,severity,description,confidence,disclaimer
+CSV-SIM-101,flood,Riverside Metro (East Embankment),2026-10-12T08:30:00Z,,,moderate,Floodwaters breaching secondary embankment near Sector 4,0.85,SYNTHETIC TEST DATA - NOT A REAL INCIDENT
+CSV-SIM-102,earthquake,Faultline District,,34.0522,-118.2437,minor,Simulated magnitude 3.2 local tremor reported by sensor network,0.98,SYNTHETIC TEST DATA - NOT A REAL INCIDENT
+CSV-SIM-103,landslide,Highland Pass Sector 9,2026-10-12T16:45:00Z,32.2190,76.3234,severe,Rockfall blocking regional highway route B-12,0.88,SYNTHETIC TEST DATA - NOT A REAL INCIDENT

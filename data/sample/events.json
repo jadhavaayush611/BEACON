@@ -1,0 +1,41 @@
+[
+  {
+    "disclaimer": "SYNTHETIC TEST DATA - NOT A REAL INCIDENT - FOR BEACON SYSTEM TESTING ONLY",
+    "record_id": "JSON-SIM-001",
+    "event_type": "flood",
+    "location": "Riverside Metro, Sector 4",
+    "event_time": "2026-10-12T08:00:00Z",
+    "latitude": 28.6139,
+    "longitude": 77.2090,
+    "severity": "severe",
+    "description": "Rapid floodwater surge exceeding 1.4m depth along the Sector 4 eastern corridor.",
+    "confidence": 0.95,
+    "source_reference": "items[0]"
+  },
+  {
+    "disclaimer": "SYNTHETIC TEST DATA - NOT A REAL INCIDENT - FOR BEACON SYSTEM TESTING ONLY",
+    "record_id": "JSON-SIM-002",
+    "event_type": "wildfire",
+    "location": "Pine Valley Ridge",
+    "event_time": "2026-10-12T14:15:00Z",
+    "latitude": null,
+    "longitude": null,
+    "severity": null,
+    "description": "Smoke plume observed spreading east from upper ridge slopes.",
+    "confidence": 0.70,
+    "source_reference": "items[1]"
+  },
+  {
+    "disclaimer": "SYNTHETIC TEST DATA - NOT A REAL INCIDENT - FOR BEACON SYSTEM TESTING ONLY",
+    "record_id": "JSON-SIM-003",
+    "event_type": "cyclone",
+    "location": "Coastal Port Delta",
+    "event_time": "2026-10-12T22:00:00Z",
+    "latitude": 20.2961,
+    "longitude": 85.8245,
+    "severity": "critical",
+    "description": "Category 3 simulated coastal storm surge approaching maritime docks.",
+    "confidence": 0.92,
+    "source_reference": "items[2]"
+  }
+]
