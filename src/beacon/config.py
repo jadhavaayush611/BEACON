@@ -7,7 +7,7 @@ settings implementations.
 
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Literal, Optional
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -67,6 +67,28 @@ class Settings(BaseSettings):
         ge=0.0,
         le=1.0,
         description="Minimum default confidence score for high-trust observations",
+    )
+
+    # Database & Storage
+    database_url: Optional[str] = Field(
+        default=None,
+        description="PostgreSQL connection URL (e.g. postgresql+psycopg://user:pass@host:5432/dbname)",
+    )
+    database_echo: bool = Field(
+        default=False,
+        description="Enable SQLAlchemy query echo logging",
+    )
+    database_pool_size: int = Field(
+        default=5,
+        description="Database connection pool size",
+    )
+    database_max_overflow: int = Field(
+        default=10,
+        description="Database connection pool maximum overflow connections",
+    )
+    test_database_url: Optional[str] = Field(
+        default=None,
+        description="Explicit test database URL for PostgreSQL integration tests",
     )
 
 

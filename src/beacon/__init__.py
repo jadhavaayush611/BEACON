@@ -19,8 +19,11 @@ from beacon.models import (
     generate_observation_id,
     generate_source_id,
 )
+from beacon.pipeline import ETLPipelineResult, ETLRunner, ObservationTransformer
+from beacon.quality import DataQualityValidator, QualityReport, RuleSeverity, ValidationOutcome
+from beacon.storage import StorageRepository, create_db_engine, get_session, get_session_factory, init_db
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "__version__",
@@ -28,6 +31,18 @@ __all__ = [
     "get_settings",
     "ingest_file",
     "IngestionResult",
+    "ETLRunner",
+    "ETLPipelineResult",
+    "ObservationTransformer",
+    "DataQualityValidator",
+    "QualityReport",
+    "RuleSeverity",
+    "ValidationOutcome",
+    "StorageRepository",
+    "create_db_engine",
+    "get_session_factory",
+    "get_session",
+    "init_db",
     "SourceType",
     "ExtractionMethod",
     "ExtractionStatus",
