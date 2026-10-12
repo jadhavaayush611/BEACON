@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
 )
 from sqlalchemy.orm import DeclarativeBase, relationship
 from sqlalchemy.types import JSON
@@ -143,4 +144,153 @@ class QualityResultModel(Base):
         "ObservationModel",
         back_populates="quality_results",
         foreign_keys=[record_id],
+    )
+
+
+class EventModel(Base):
+    """Stores consolidated unified disaster event profiles."""
+
+    __tablename__ = "events"
+
+    event_id = Column(String(64), primary_key=True)
+    event_type = Column(String(128), nullable=False, index=True)
+    location = Column(Text, nullable=False)
+    start_time = Column(DateTime(timezone=True), nullable=False, index=True)
+    end_time = Column(DateTime(timezone=True), nullable=True)
+    summary = Column(Text, nullable=False)
+    severity = Column(String(32), nullable=True)
+    resolution_rationale = Column(Text, nullable=True)
+    conflicting_claims = Column(JSON, nullable=False, default=list)
+    source_ids = Column(JSON, nullable=False, default=list)
+    metadata_json = Column("metadata", JSON, nullable=False, default=dict)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    updated_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+    )
+
+    event_observations = relationship(
+        "EventObservationModel",
+        back_populates="event",
+        cascade="all, delete-orphan",
+    )
+    decisions = relationship(
+        "ResolutionDecisionModel",
+        back_populates="event",
+    )
+
+
+class EventObservationModel(Base):
+    """Junction table linking unified events to their constituent observations."""
+
+    __tablename__ = "event_observations"
+    __table_args__ = (
+        UniqueConstraint("event_id", "observation_id", name="uq_event_observation"),
+    )
+
+    id = Column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    event_id = Column(
+        String(64),
+        ForeignKey("events.event_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    observation_id = Column(
+        String(64),
+        ForeignKey("observations.observation_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    confidence_score = Column(Float, nullable=True)
+    assigned_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    event = relationship("EventModel", back_populates="event_observations")
+    observation = relationship("ObservationModel")
+
+
+class ResolutionDecisionModel(Base):
+    """Stores explainable audit records of observation-to-event matching decisions."""
+
+    __tablename__ = "resolution_decisions"
+
+    id = Column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    observation_id = Column(
+        String(64),
+        ForeignKey("observations.observation_id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    event_id = Column(
+        String(64),
+        ForeignKey("events.event_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    decision_type = Column(String(32), nullable=False, index=True)
+    composite_score = Column(Float, nullable=False)
+    feature_scores = Column(JSON, nullable=False, default=dict)
+    rationale = Column(Text, nullable=False)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+    observation = relationship("ObservationModel")
+    event = relationship("EventModel", back_populates="decisions")
+
+
+class MergeCandidateModel(Base):
+    """Stores potential multi-event bridge / merge candidates for manual audit."""
+
+    __tablename__ = "merge_candidates"
+
+    id = Column(
+        BigInteger().with_variant(Integer, "sqlite"),
+        primary_key=True,
+        autoincrement=True,
+    )
+    primary_event_id = Column(
+        String(64),
+        ForeignKey("events.event_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    secondary_event_id = Column(
+        String(64),
+        ForeignKey("events.event_id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    bridging_observation_id = Column(
+        String(64),
+        ForeignKey("observations.observation_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    similarity_score = Column(Float, nullable=False)
+    rationale = Column(Text, nullable=False)
+    status = Column(String(32), nullable=False, default="pending_review", index=True)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
     )

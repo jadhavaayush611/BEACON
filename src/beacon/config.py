@@ -69,6 +69,54 @@ class Settings(BaseSettings):
         description="Minimum default confidence score for high-trust observations",
     )
 
+    # Event Resolution parameters
+    resolution_match_threshold: float = Field(
+        default=0.75,
+        ge=0.0,
+        le=1.0,
+        description="Minimum similarity score for confident event match",
+    )
+    resolution_ambiguity_threshold: float = Field(
+        default=0.50,
+        ge=0.0,
+        le=1.0,
+        description="Minimum similarity score to flag candidate as ambiguous match",
+    )
+    resolution_max_spatial_distance_km: float = Field(
+        default=50.0,
+        ge=0.0,
+        description="Maximum geographic radius in km for co-reference consideration",
+    )
+    resolution_max_temporal_distance_hours: float = Field(
+        default=48.0,
+        ge=0.0,
+        description="Maximum temporal window in hours for candidate co-reference",
+    )
+    resolution_type_weight: float = Field(
+        default=0.35,
+        ge=0.0,
+        le=1.0,
+        description="Weight of event category match in composite score",
+    )
+    resolution_spatial_weight: float = Field(
+        default=0.30,
+        ge=0.0,
+        le=1.0,
+        description="Weight of coordinate spatial proximity in composite score",
+    )
+    resolution_temporal_weight: float = Field(
+        default=0.20,
+        ge=0.0,
+        le=1.0,
+        description="Weight of timestamp temporal proximity in composite score",
+    )
+    resolution_location_text_weight: float = Field(
+        default=0.15,
+        ge=0.0,
+        le=1.0,
+        description="Weight of textual location similarity in composite score",
+    )
+
     # Database & Storage
     database_url: Optional[str] = Field(
         default=None,

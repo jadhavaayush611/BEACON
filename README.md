@@ -6,14 +6,16 @@ BEACON is a production-grade data engineering pipeline engineered to ingest hete
 
 ---
 
-## Current Status: Phase 3 (ETL, Data Quality & PostgreSQL Storage Completed)
+## Current Status: Phase 4 (Event Resolution & Analytics Completed)
 
-Phase 3 implements the complete, idempotent, auditable data engineering pipeline:
-- **Observation Transformation Layer (`ObservationTransformer`):** Deterministic normalization of whitespace, geographic coordinate precision (6 decimal places), severity scale, and event category synonyms without fabricating missing facts.
-- **Data Quality Framework (`beacon.quality`):** Machine-readable validation rules with explicit severity tiers (`ERROR`, `WARNING`, `INFO`), generating fine-grained `ValidationOutcome` records and `QualityReport` summaries. Records with fatal errors are rejected from persistence while audit records are preserved.
-- **Relational PostgreSQL Storage (`beacon.storage`):** Production-grade SQLAlchemy 2.0 schemas (`sources`, `observations`, `data_quality_results`), pure SQL DDL (`schema.sql`), connection pooling, and atomic transaction handling with rollback protection.
-- **ETL Pipeline Orchestrator (`ETLRunner`):** End-to-end Extract $\rightarrow$ Transform $\rightarrow$ Validate $\rightarrow$ Load $\rightarrow$ Report execution with partial-failure isolation and deterministic rerun idempotency.
-- **Database CLI Initializer (`scripts/init_db.py`):** Schema creation and reset utility.
+Phase 4 implements an explainable, deterministic event-resolution layer and analytics engine:
+- **Core Proposition:** "One event, many sources, one trusted data profile."
+- **Multi-Attribute Blocking (`CandidateGenerator`):** Category compatibility, temporal bounds, and spatial bounding boxes to evaluate co-referent events without quadratic comparisons.
+- **Feature Comparison & Scoring Engine (`ObservationMatcher`):** Spatiotemporal proximity via Haversine distance, temporal hours delta, textual token Jaccard similarity, dynamic weight rebalancing, and calibration safeguards.
+- **Decision Policy & Bridge Detection (`MatchPolicy`):** Classifies candidate matches into `confident_match`, `ambiguous_candidate`, `no_match`, and flags multi-event bridges as `merge_candidate` for human audit without silent destructive merges.
+- **Unified Profile Synthesis (`EventProfileAggregator`):** Derives canonical `UnifiedDisasterEvent` profiles, spatiotemporal extents, bounding boxes, consensus values, and tracks divergent values in `conflicting_claims`.
+- **Relational Storage & Additive Migration:** Extends schema with `events`, `event_observations`, `resolution_decisions`, and `merge_candidates`. Includes pure SQL migration `v0_4_event_resolution.sql` and CLI `scripts/migrate_v0_4.py`.
+- **Disaster Intelligence Analytics (`AnalyticsService`):** Aggregates compression ratios, multi-source validation metrics, spatial/temporal coverage gaps, and conflicting claim breakdowns.
 
 ---
 
@@ -59,12 +61,27 @@ beacon/
 │       │   ├── transform.py           # ObservationTransformer normalization engine
 │       │   ├── result.py              # ETLPipelineResult execution metrics
 │       │   └── runner.py              # ETLRunner (Extract -> Transform -> Validate -> Load -> Report)
+│       ├── resolution/                # Event Resolution & Entity Linking
+│       │   ├── __init__.py            # Resolution public API exports
+│       │   ├── distance.py            # Haversine, temporal hours, and token similarity
+│       │   ├── models.py              # FeatureScores, CandidateMatch, MergeCandidate, ResolutionResult
+│       │   ├── matcher.py             # Multi-feature ObservationMatcher & dynamic reweighting
+│       │   ├── candidate_generator.py # Multi-attribute blocking (type, time, space)
+│       │   ├── policy.py              # MatchPolicy classification & bridge detection
+│       │   ├── aggregator.py          # EventProfileAggregator profile synthesis & conflict tracking
+│       │   └── resolver.py            # EventResolver batch orchestrator
+│       ├── analytics/                 # Disaster Intelligence Analytics
+│       │   ├── __init__.py            # Analytics exports
+│       │   ├── models.py              # AnalyticsFilter, AnalyticsSummary, CoverageGaps
+│       │   └── service.py             # AnalyticsService aggregations & database metrics
 │       └── storage/                   # Relational Persistence Layer
 │           ├── __init__.py            # Storage exports
-│           ├── schema.py              # SQLAlchemy ORM models (SourceModel, ObservationModel, QualityResultModel)
+│           ├── schema.py              # SQLAlchemy ORM models (Source, Observation, Event, Links, Audits)
 │           ├── schema.sql             # Portable pure PostgreSQL DDL script
 │           ├── connection.py          # Engine creation, pooling, session factory & context manager
-│           └── repository.py          # StorageRepository idempotent CRUD & queries
+│           ├── repository.py          # StorageRepository idempotent CRUD & queries
+│           └── migrations/            # Additive migration scripts
+│               └── v0_4_event_resolution.sql # Phase 4 additive DDL script
 ├── data/
 │   ├── raw/
 │   │   └── .gitkeep                   # Local directory for uncommitted raw ingestion files
@@ -77,7 +94,8 @@ beacon/
 │       └── sample_disaster.png        # Synthetic raster hazard map (PNG)
 ├── scripts/
 │   ├── generate_sample_binaries.py    # Deterministic pure-Python sample PDF/PNG generator
-│   └── init_db.py                     # CLI database schema initialization & reset script
+│   ├── init_db.py                     # CLI database schema initialization & reset script
+│   └── migrate_v0_4.py                # CLI database Phase 4 additive migration script
 ├── tests/
 │   ├── test_models.py                 # Data contract validations & constraints
 │   ├── test_config.py                 # Configuration and logging filter tests
@@ -88,11 +106,21 @@ beacon/
 │   ├── test_pipeline.py               # ETLRunner flow, idempotency, and failure isolation
 │   ├── test_storage_unit.py           # In-memory database schema, repository, and rollback tests
 │   ├── test_init_db.py                # Database CLI safety and confirmation workflow tests
-│   └── test_storage_integration.py    # Live PostgreSQL integration test (skipped if DB unset)
+│   ├── test_storage_integration.py    # Live PostgreSQL integration test (skipped if DB unset)
+│   ├── test_distance.py               # Haversine, temporal hours, and text similarity unit tests
+│   ├── test_matcher.py                # Multi-feature ObservationMatcher tests
+│   ├── test_candidate_generator.py    # Multi-attribute blocking tests
+│   ├── test_policy.py                 # MatchPolicy decision and bridge detection tests
+│   ├── test_aggregator.py             # Event profile aggregation & conflicting claim tests
+│   ├── test_resolver.py               # EventResolver orchestration & cross-source co-reference
+│   ├── test_analytics.py              # Disaster intelligence analytics tests
+│   ├── test_resolution_storage.py     # Event storage, linkage, and audit persistence tests
+│   └── test_migration_v0_4.py         # Phase 4 migration CLI and safety tests
 └── docs/
     ├── data_contract.md               # Canonical data contracts specification
     ├── ingestion.md                   # Ingestion & extraction architecture guide
-    └── etl_and_storage.md             # ETL pipeline, data quality & PostgreSQL storage guide
+    ├── etl_and_storage.md             # ETL pipeline, data quality & PostgreSQL storage guide
+    └── event_resolution.md            # Event resolution, bridge detection & analytics guide
 ```
 
 ---
@@ -130,7 +158,7 @@ Copy-Item .env.example .env
 pytest -v
 ```
 
-All 141 unit tests run completely locally without requiring external APIs, PostgreSQL, or OCR binaries.
+All 198 unit tests run completely locally without requiring external APIs, PostgreSQL, or OCR binaries.
 
 To optionally run integration tests against a live PostgreSQL database:
 ```powershell
@@ -140,46 +168,55 @@ pytest -v tests/test_storage_integration.py
 
 ---
 
-## ETL Pipeline Usage Examples
+## Event Resolution & Analytics Usage Examples
 
-### Running the End-to-End Pipeline
+### End-to-End Event Resolution
 ```python
 from pathlib import Path
-from beacon.pipeline import ETLRunner
-from beacon.storage import create_db_engine, get_session_factory
+from beacon.ingestion import ingest_file
+from beacon.pipeline import ObservationTransformer
+from beacon.resolution import EventResolver
+from beacon.analytics import AnalyticsService
 
-# 1. Create session factory (or pass None to run in storage-free in-memory mode)
-engine = create_db_engine()
-session_factory = get_session_factory(engine)
-
-# 2. Initialize ETL runner
-runner = ETLRunner(session_factory=session_factory)
-
-# 3. Execute across input files
-input_files = [
+# 1. Ingest heterogeneous files
+sample_files = [
     Path("data/sample/events.json"),
     Path("data/sample/events.csv"),
     Path("data/sample/events.txt"),
     Path("data/sample/sample_report.pdf"),
 ]
-result = runner.run(input_files)
+transformer = ObservationTransformer()
+observations = []
+for p in sample_files:
+    res = ingest_file(p)
+    for raw in res.observations:
+        observations.append(transformer.transform(raw))
 
-# 4. View results
-print(result.summary())
-print(f"Accepted observations: {result.observations_accepted}")
-print(f"Persisted records: {result.records_persisted}")
+# 2. Resolve co-referent observations into unified events
+resolver = EventResolver()
+res_result = resolver.resolve_observations(observations)
+
+print(f"Total Observations: {res_result.total_observations}")
+print(f"Events Created: {res_result.events_created}")
+for ev in res_result.resolved_events:
+    print(f"Unified Event [{ev.event_id}]: {ev.summary}")
+    print(f"  Contributing Sources ({len(ev.source_ids)}): {ev.source_ids}")
+    print(f"  Conflicting Claims ({len(ev.conflicting_claims)}): {ev.conflicting_claims}")
+
+# 3. Compute disaster intelligence analytics
+analytics = AnalyticsService()
+summary = analytics.summarize(res_result.resolved_events, observations=observations)
+print(f"Compression Ratio: {summary.compression_ratio}")
+print(f"Multi-Source Ratio: {summary.multi_source_ratio * 100:.1f}%")
 ```
 
-### Database Initialization CLI
+### Database Migration CLI
 ```powershell
-# Create tables non-destructively using settings from .env
-python scripts/init_db.py
+# Inspect migration DDL without applying changes
+python scripts/migrate_v0_4.py --dry-run
 
-# Drop and recreate tables interactively (prompts for confirmation)
-python scripts/init_db.py --drop-first
-
-# Drop and recreate tables non-interactively / in CI (requires explicit --yes)
-python scripts/init_db.py --drop-first --yes
+# Apply additive migration to target database
+python scripts/migrate_v0_4.py --url postgresql+psycopg://postgres:postgres@localhost:5432/beacon
 ```
 
 ---
@@ -191,5 +228,5 @@ python scripts/init_db.py --drop-first --yes
 | **Phase 1** | **Foundation & Data Contracts** | Canonical Pydantic schemas, deterministic IDs, config, sample datasets, unit test suite. | **Completed** |
 | **Phase 2** | **Multi-Format Ingestion & Extraction** | Extractors for JSON, CSV, structured TXT, multi-page PDF (`pypdf`), and image validation (`Pillow`). | **Completed** |
 | **Phase 3** | **ETL, Data Quality & PostgreSQL Storage** | Decoupled ETL pipeline, explicit DQ rules/audit reports, SQLAlchemy 2.0 ORM & PostgreSQL persistence. | **Completed** |
-| **Phase 4** | **Entity Resolution & Unified Event Synthesis** | Spatiotemporal clustering, cross-source co-reference, confidence weighting, and conflict tracking. | Upcoming |
+| **Phase 4** | **Entity Resolution & Unified Event Synthesis** | Spatiotemporal clustering, cross-source co-reference, confidence weighting, conflict tracking, and analytics. | **Completed** |
 | **Phase 5** | **Disaster Intelligence Dashboard** | Interactive Streamlit/FastAPI UI for situation awareness, audit trails, and data profiling. | Upcoming |

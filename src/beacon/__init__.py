@@ -19,11 +19,26 @@ from beacon.models import (
     generate_observation_id,
     generate_source_id,
 )
+from beacon.analytics import AnalyticsFilter, AnalyticsService, AnalyticsSummary, CoverageGaps
 from beacon.pipeline import ETLPipelineResult, ETLRunner, ObservationTransformer
 from beacon.quality import DataQualityValidator, QualityReport, RuleSeverity, ValidationOutcome
+from beacon.resolution import (
+    CandidateGenerator,
+    CandidateMatch,
+    DecisionType,
+    EventProfileAggregator,
+    EventResolver,
+    FeatureScores,
+    MatchPolicy,
+    MergeCandidate,
+    ObservationMatcher,
+    ResolutionOutcome,
+    ResolutionResult,
+    haversine_distance_km,
+)
 from beacon.storage import StorageRepository, create_db_engine, get_session, get_session_factory, init_db
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
 
 __all__ = [
     "__version__",
@@ -55,4 +70,20 @@ __all__ = [
     "generate_source_id",
     "generate_observation_id",
     "generate_event_id",
+    "EventResolver",
+    "ObservationMatcher",
+    "CandidateGenerator",
+    "MatchPolicy",
+    "EventProfileAggregator",
+    "DecisionType",
+    "ResolutionResult",
+    "ResolutionOutcome",
+    "CandidateMatch",
+    "MergeCandidate",
+    "FeatureScores",
+    "haversine_distance_km",
+    "AnalyticsService",
+    "AnalyticsSummary",
+    "AnalyticsFilter",
+    "CoverageGaps",
 ]
