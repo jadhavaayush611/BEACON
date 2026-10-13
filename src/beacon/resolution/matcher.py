@@ -1,6 +1,6 @@
 """Feature comparison and scoring engine for event resolution."""
 
-from datetime import datetime, timezone
+from datetime import datetime
 import logging
 from typing import Any, Optional, Union
 

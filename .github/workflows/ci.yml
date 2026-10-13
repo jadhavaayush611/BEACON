@@ -1,0 +1,76 @@
+name: BEACON CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: beacon_ci
+          POSTGRES_PASSWORD: beacon_ci_password
+          POSTGRES_DB: beacon_ci_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    env:
+      BEACON_TEST_DATABASE_URL: postgresql+psycopg://beacon_ci:beacon_ci_password@localhost:5432/beacon_ci_test
+      BEACON_REQUIRE_POSTGRES: "1"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: "pip"
+
+      - name: Upgrade pip and install build dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install -e .
+
+      - name: Run code formatting and diff check
+        run: |
+          git diff --check
+
+      - name: Run Python static analysis with Ruff
+        run: |
+          ruff check .
+
+      - name: Run complete test suite with live PostgreSQL
+        run: |
+          pytest -v --durations=10
+
+      - name: Verify CLI migration and database initialization utilities
+        run: |
+          python scripts/init_db.py --url "$BEACON_TEST_DATABASE_URL" --drop-first --yes
+          python scripts/migrate_v0_4.py --url "$BEACON_TEST_DATABASE_URL"

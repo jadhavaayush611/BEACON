@@ -9,7 +9,6 @@ from beacon.models import (
     ConflictingClaim,
     DisasterObservation,
     UnifiedDisasterEvent,
-    ensure_utc_aware,
     generate_event_id,
 )
 
@@ -106,7 +105,7 @@ class EventProfileAggregator:
         loc_counts = Counter(o.location.strip() for o in sorted_obs if o.location)
         if loc_counts:
             # Select most common; break ties preferring longer, more descriptive name, then alphabetical
-            best_loc = sorted(loc_counts.keys(), key=lambda l: (-loc_counts[l], -len(l), l))[0]
+            best_loc = sorted(loc_counts.keys(), key=lambda loc: (-loc_counts[loc], -len(loc), loc))[0]
         else:
             best_loc = "Unknown Location"
 

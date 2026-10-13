@@ -16,7 +16,7 @@ from beacon.models import (
     SourceType,
     UnifiedDisasterEvent,
 )
-from beacon.quality.models import RuleSeverity, ValidationOutcome
+from beacon.quality.models import ValidationOutcome
 from beacon.resolution.models import (
     MergeCandidate,
     ResolutionOutcome,

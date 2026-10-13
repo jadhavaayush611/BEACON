@@ -10,7 +10,6 @@ from sqlalchemy.schema import UniqueConstraint
 
 from beacon.models import (
     ConflictingClaim,
-    DisasterObservation,
     UnifiedDisasterEvent,
 )
 from beacon.resolution.models import (
@@ -23,12 +22,7 @@ from beacon.resolution.models import (
 from beacon.storage.repository import StorageRepository
 from beacon.storage.schema import (
     Base,
-    EventModel,
     EventObservationModel,
-    MergeCandidateModel,
-    ObservationModel,
-    ResolutionDecisionModel,
-    SourceModel,
 )
 
 

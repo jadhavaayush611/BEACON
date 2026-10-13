@@ -1,6 +1,5 @@
 """Unit tests for scripts/migrate_v0_4.py migration CLI and SQL safety."""
 
-from pathlib import Path
 import pytest
 
 from scripts.migrate_v0_4 import load_migration_sql, main

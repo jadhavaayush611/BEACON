@@ -6,16 +6,16 @@ BEACON is a production-grade data engineering pipeline engineered to ingest hete
 
 ---
 
-## Current Status: Phase 4 (Event Resolution & Analytics Completed)
+## Current Status: v1.0.0 MVP (Release Hardening & Dashboard Completed)
 
-Phase 4 implements an explainable, deterministic event-resolution layer and analytics engine:
-- **Core Proposition:** "One event, many sources, one trusted data profile."
-- **Multi-Attribute Blocking (`CandidateGenerator`):** Category compatibility, temporal bounds, and spatial bounding boxes to evaluate co-referent events without quadratic comparisons.
-- **Feature Comparison & Scoring Engine (`ObservationMatcher`):** Spatiotemporal proximity via Haversine distance, temporal hours delta, textual token Jaccard similarity, dynamic weight rebalancing, and calibration safeguards.
-- **Decision Policy & Bridge Detection (`MatchPolicy`):** Classifies candidate matches into `confident_match`, `ambiguous_candidate`, `no_match`, and flags multi-event bridges as `merge_candidate` for human audit without silent destructive merges.
-- **Unified Profile Synthesis (`EventProfileAggregator`):** Derives canonical `UnifiedDisasterEvent` profiles, spatiotemporal extents, bounding boxes, consensus values, and tracks divergent values in `conflicting_claims`.
-- **Relational Storage & Additive Migration:** Extends schema with `events`, `event_observations`, `resolution_decisions`, and `merge_candidates`. Includes pure SQL migration `v0_4_event_resolution.sql` and CLI `scripts/migrate_v0_4.py`.
-- **Disaster Intelligence Analytics (`AnalyticsService`):** Aggregates compression ratios, multi-source validation metrics, spatial/temporal coverage gaps, and conflicting claim breakdowns.
+BEACON delivers an end-to-end multi-format disaster intelligence engineering pipeline with:
+- **Heterogeneous Ingestion:** Structured JSON, sensor CSV, structured situation reports (TXT), multi-page PDF (`pypdf`), and raster image validation (`Pillow`).
+- **ETL & Data Quality Framework:** Normalized observation attributes, explicit data quality rule audits (`RuleSeverity.ERROR`, `WARNING`, `INFO`), and atomic error isolation.
+- **Explainable Event Resolution:** Multi-attribute candidate blocking (`CandidateGenerator`), spatiotemporal proximity scoring (`ObservationMatcher`), deterministic policy (`MatchPolicy`), and canonical profile synthesis (`EventProfileAggregator`) with preserved conflicting claims.
+- **Relational PostgreSQL Storage & Additive Migrations:** Seven relational tables with composite unique constraints, cascade rules, transaction safety, and pure additive idempotent migration scripts (`scripts/migrate_v0_4.py`).
+- **Disaster Intelligence Analytics (`AnalyticsService`):** Compression ratios, multi-source validation percentages, coverage gaps, and conflict frequency.
+- **Interactive Streamlit Dashboard:** Complete dashboard (`src/beacon/dashboard/`) featuring Overview KPI cards, Multi-Format Ingestion upload, Pipeline Execution, Unified Event Explorer, Disaster Analytics, and Database Health diagnostics.
+- **Continuous Integration (CI):** Fully automated GitHub Actions workflow verifying Python 3.10-3.12 with a live PostgreSQL 15 service container.
 
 ---
 
@@ -158,66 +158,65 @@ Copy-Item .env.example .env
 pytest -v
 ```
 
-All 198 unit tests run completely locally without requiring external APIs, PostgreSQL, or OCR binaries.
+All 216 unit and contract tests run completely locally without requiring external APIs, PostgreSQL, or OCR binaries.
 
-To optionally run integration tests against a live PostgreSQL database:
+To run the complete test suite against a live PostgreSQL database:
 ```powershell
-$env:BEACON_TEST_DATABASE_URL = "postgresql+psycopg://postgres:postgres@localhost:5432/beacon_test"
-pytest -v tests/test_storage_integration.py
+$env:BEACON_TEST_DATABASE_URL = "postgresql+psycopg://username:password@localhost:5432/beacon_test"
+$env:BEACON_REQUIRE_POSTGRES = "1"
+pytest -v
 ```
 
 ---
 
-## Event Resolution & Analytics Usage Examples
+## Launching the Streamlit Dashboard
 
-### End-to-End Event Resolution
-```python
-from pathlib import Path
-from beacon.ingestion import ingest_file
-from beacon.pipeline import ObservationTransformer
-from beacon.resolution import EventResolver
-from beacon.analytics import AnalyticsService
+Launch the interactive web dashboard with a single command:
 
-# 1. Ingest heterogeneous files
-sample_files = [
-    Path("data/sample/events.json"),
-    Path("data/sample/events.csv"),
-    Path("data/sample/events.txt"),
-    Path("data/sample/sample_report.pdf"),
-]
-transformer = ObservationTransformer()
-observations = []
-for p in sample_files:
-    res = ingest_file(p)
-    for raw in res.observations:
-        observations.append(transformer.transform(raw))
-
-# 2. Resolve co-referent observations into unified events
-resolver = EventResolver()
-res_result = resolver.resolve_observations(observations)
-
-print(f"Total Observations: {res_result.total_observations}")
-print(f"Events Created: {res_result.events_created}")
-for ev in res_result.resolved_events:
-    print(f"Unified Event [{ev.event_id}]: {ev.summary}")
-    print(f"  Contributing Sources ({len(ev.source_ids)}): {ev.source_ids}")
-    print(f"  Conflicting Claims ({len(ev.conflicting_claims)}): {ev.conflicting_claims}")
-
-# 3. Compute disaster intelligence analytics
-analytics = AnalyticsService()
-summary = analytics.summarize(res_result.resolved_events, observations=observations)
-print(f"Compression Ratio: {summary.compression_ratio}")
-print(f"Multi-Source Ratio: {summary.multi_source_ratio * 100:.1f}%")
-```
-
-### Database Migration CLI
 ```powershell
-# Inspect migration DDL without applying changes
-python scripts/migrate_v0_4.py --dry-run
+# Using Streamlit directly
+streamlit run src/beacon/dashboard/app.py
 
-# Apply additive migration to target database
-python scripts/migrate_v0_4.py --url postgresql+psycopg://postgres:postgres@localhost:5432/beacon
+# Or using the package CLI entrypoint
+beacon-dashboard
 ```
+
+The dashboard opens at `http://localhost:8501` featuring:
+1. **Overview:** System KPIs, multi-source corroboration percentage, coverage gaps, and audit flags.
+2. **Ingestion:** Drag-and-drop file upload supporting JSON, CSV, TXT, PDF, and PNG/JPEG images.
+3. **Pipeline Execution:** Step-by-step ETL and Event Resolution execution over ingested files.
+4. **Unified Event Explorer:** Search and filter canonical disaster events by type, severity, location, and drill down into constituent observations and conflicting claims.
+5. **Disaster Analytics:** Real-time charts for disaster distributions, conflict frequency, and compression ratios.
+6. **Database & Diagnostics:** Relational table row counts, connection status, and configuration inspection.
+
+---
+
+## Database Initialization & Migration
+
+```powershell
+# 1. Fresh Database Initialization (Initializes all 7 tables)
+python scripts/init_db.py --url postgresql+psycopg://username:password@localhost:5432/beacon
+
+# 2. Additive Migration from Phase 3 to Phase 4 / v1.0
+python scripts/migrate_v0_4.py --url postgresql+psycopg://username:password@localhost:5432/beacon
+
+# Inspect migration SQL without applying changes
+python scripts/migrate_v0_4.py --dry-run
+```
+
+For detailed migration, isolation, and rollback guidance, see [docs/database_migration.md](docs/database_migration.md).
+
+---
+
+## Known System Boundaries & Explicit Limitations
+
+> [!WARNING]
+> **Image Extraction Boundary:**
+> The image ingestor validates file integrity, dimensions, and image format metadata using Pillow. It explicitly **does not perform Optical Character Recognition (OCR)** or machine-vision feature extraction.
+
+> [!WARNING]
+> **Antimeridian Bounding-Box Boundary:**
+> The synthesized event bounding box computes standard Cartesian planar extrema (`min` and `max` longitude). It is not antimeridian-aware across the $\pm 180^\circ$ International Date Line. Individual constituent observation coordinates remain intact for spherical GIS calculations.
 
 ---
 
@@ -225,8 +224,8 @@ python scripts/migrate_v0_4.py --url postgresql+psycopg://postgres:postgres@loca
 
 | Phase | Title | Focus Area | Status |
 |---|---|---|---|
-| **Phase 1** | **Foundation & Data Contracts** | Canonical Pydantic schemas, deterministic IDs, config, sample datasets, unit test suite. | **Completed** |
-| **Phase 2** | **Multi-Format Ingestion & Extraction** | Extractors for JSON, CSV, structured TXT, multi-page PDF (`pypdf`), and image validation (`Pillow`). | **Completed** |
-| **Phase 3** | **ETL, Data Quality & PostgreSQL Storage** | Decoupled ETL pipeline, explicit DQ rules/audit reports, SQLAlchemy 2.0 ORM & PostgreSQL persistence. | **Completed** |
-| **Phase 4** | **Entity Resolution & Unified Event Synthesis** | Spatiotemporal clustering, cross-source co-reference, confidence weighting, conflict tracking, and analytics. | **Completed** |
-| **Phase 5** | **Disaster Intelligence Dashboard** | Interactive Streamlit/FastAPI UI for situation awareness, audit trails, and data profiling. | Upcoming |
+| **Phase 1** | **Foundation & Data Contracts** | Canonical Pydantic schemas, deterministic IDs, config, sample datasets, unit test suite. | **Completed (`v0.1-foundation`)** |
+| **Phase 2** | **Multi-Format Ingestion & Extraction** | Extractors for JSON, CSV, structured TXT, multi-page PDF (`pypdf`), and image validation (`Pillow`). | **Completed (`v0.2-ingestion`)** |
+| **Phase 3** | **ETL, Data Quality & PostgreSQL Storage** | Decoupled ETL pipeline, explicit DQ rules/audit reports, SQLAlchemy 2.0 ORM & PostgreSQL persistence. | **Completed (`v0.3-storage`)** |
+| **Phase 4** | **Entity Resolution & Unified Event Synthesis** | Spatiotemporal clustering, cross-source co-reference, confidence weighting, conflict tracking, and analytics. | **Completed (`v0.4-event-resolution`)** |
+| **Phase 5** | **Release Hardening & Streamlit Dashboard** | Multi-screen dashboard, live PostgreSQL CI, E2E validation, and v1.0.0 MVP release. | **Completed (`v1.0.0`)** |

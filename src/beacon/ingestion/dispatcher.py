@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 import logging
 from pathlib import Path
-from typing import Optional, Union
+from typing import Union
 
 from beacon.ingestion.base import BaseIngestor
 from beacon.ingestion.csv_ingestor import CsvIngestor

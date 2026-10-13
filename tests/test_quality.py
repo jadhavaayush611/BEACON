@@ -1,9 +1,8 @@
 """Unit tests for BEACON Data Quality framework, models, rules, and validator."""
 
 from datetime import datetime, timezone
-import pytest
 
-from beacon.models import DisasterObservation, SeverityLevel
+from beacon.models import DisasterObservation
 from beacon.quality import (
     DataQualityValidator,
     QualityReport,
