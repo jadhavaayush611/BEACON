@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 import hashlib
 import logging
 from pathlib import Path
-from typing import Optional, Sequence, Union
+from typing import Any, Optional, Sequence, Union
 
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -29,12 +29,16 @@ class ETLRunner:
         transformer: Optional[ObservationTransformer] = None,
         validator: Optional[DataQualityValidator] = None,
         repository: Optional[StorageRepository] = None,
+        resolver: Optional[Any] = None,
     ) -> None:
         self.settings = settings or get_settings()
         self.transformer = transformer or ObservationTransformer()
         self.validator = validator or DataQualityValidator()
         self.repository = repository or StorageRepository()
         self.session_factory = session_factory
+
+        from beacon.resolution.resolver import EventResolver
+        self.resolver = resolver or EventResolver(settings=self.settings)
 
         # Initialize session_factory lazily from settings if configured and not explicitly provided
         if self.session_factory is None and self.settings.database_url:
@@ -103,7 +107,11 @@ class ETLRunner:
 
         return persisted_observations
 
-    def run(self, file_paths: Sequence[Union[str, Path]]) -> ETLPipelineResult:
+    def run(
+        self,
+        file_paths: Sequence[Union[str, Path]],
+        enable_resolution: bool = False,
+    ) -> ETLPipelineResult:
         """Execute the end-to-end pipeline: Extract -> Transform -> Validate -> Load -> Report.
 
         Safe to rerun and isolates partial failures.
@@ -138,6 +146,9 @@ class ETLRunner:
 
         # 4. Load (if storage session factory is configured)
         records_persisted = 0
+        events_synthesized = 0
+        events_persisted = 0
+        res_summary = None
         storage_enabled = self.session_factory is not None
 
         if storage_enabled:
@@ -156,7 +167,36 @@ class ETLRunner:
         else:
             logger.info("Database storage not configured; skipping persistence step")
 
-        # 5. Report
+        # 5. Optional Event Resolution
+        if enable_resolution and quality_report.accepted_records:
+            logger.info(
+                "Resolving %d accepted observations into unified events",
+                len(quality_report.accepted_records),
+            )
+            res_result = self.resolver.resolve_observations(quality_report.accepted_records)
+            events_synthesized = len(res_result.resolved_events)
+            res_summary = {
+                "total_observations": res_result.total_observations,
+                "events_created": res_result.events_created,
+                "events_updated": res_result.events_updated,
+                "observations_assigned": res_result.observations_assigned,
+                "ambiguous_count": res_result.ambiguous_count,
+                "merge_candidates_count": len(res_result.merge_candidates),
+                "resolved_events_count": len(res_result.resolved_events),
+            }
+
+            if storage_enabled:
+                assert self.session_factory is not None
+                try:
+                    with get_session(self.session_factory) as session:
+                        res_counts = self.repository.save_resolution_result(res_result, session)
+                        events_persisted = res_counts.get("events_persisted", 0)
+                except Exception as res_db_err:
+                    err_msg = f"Database persistence failed during event resolution: {res_db_err}"
+                    logger.error(err_msg)
+                    errors.append(err_msg)
+
+        # 6. Report
         return ETLPipelineResult(
             execution_id=exec_id,
             execution_timestamp=run_ts,
@@ -168,9 +208,18 @@ class ETLRunner:
             observations_accepted=len(quality_report.accepted_records),
             observations_rejected=len(quality_report.rejected_record_ids),
             records_persisted=records_persisted,
+            events_synthesized=events_synthesized,
+            events_persisted=events_persisted,
+            resolution_summary=res_summary,
             storage_enabled=storage_enabled,
             quality_report=quality_report,
             file_results=ingestion_results,
             errors=errors,
             warnings=warnings,
         )
+
+    def run_complete_pipeline(
+        self, file_paths: Sequence[Union[str, Path]]
+    ) -> ETLPipelineResult:
+        """Execute complete end-to-end pipeline with event resolution enabled."""
+        return self.run(file_paths, enable_resolution=True)

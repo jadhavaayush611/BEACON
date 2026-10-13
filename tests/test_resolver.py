@@ -6,9 +6,8 @@ import pytest
 
 from beacon.config import Settings
 from beacon.ingestion import ingest_file
-from beacon.models import DisasterObservation, UnifiedDisasterEvent
+from beacon.models import DisasterObservation
 from beacon.pipeline.transform import ObservationTransformer
-from beacon.resolution.models import DecisionType
 from beacon.resolution.resolver import EventResolver
 
 SAMPLE_DIR = Path(__file__).parent.parent / "data" / "sample"

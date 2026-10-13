@@ -12,7 +12,6 @@ from beacon.models import (
     DisasterObservation,
     UnifiedDisasterEvent,
 )
-from beacon.resolution.models import MergeCandidate
 from beacon.storage.repository import StorageRepository
 from beacon.storage.schema import Base
 

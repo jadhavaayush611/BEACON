@@ -5,9 +5,7 @@ import re
 from typing import Optional, Sequence
 
 from beacon.models import (
-    STANDARD_EVENT_TYPES,
     DisasterObservation,
-    SeverityLevel,
 )
 
 logger = logging.getLogger("beacon.pipeline.transform")

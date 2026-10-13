@@ -1,6 +1,6 @@
 """Unit tests for spatial, temporal, and text distance calculation helpers."""
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import math
 import pytest
 

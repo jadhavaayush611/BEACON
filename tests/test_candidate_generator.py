@@ -1,6 +1,6 @@
 """Unit tests for CandidateGenerator multi-attribute blocking."""
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 import pytest
 
 from beacon.config import Settings

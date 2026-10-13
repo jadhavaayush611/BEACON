@@ -4,14 +4,11 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
-import struct
-import zlib
 import pytest
 
 from beacon.ingestion import (
     CsvIngestor,
     ImageIngestor,
-    IngestionResult,
     JsonIngestor,
     PdfIngestor,
     SourceFileNotFoundError,
@@ -380,7 +377,6 @@ class TestPdfIngestion:
     def test_scanned_or_blank_pdf_no_false_ocr(self, tmp_path: Path) -> None:
         """A PDF with blank content stream should not extract false observations."""
         blank_pdf = tmp_path / "blank.pdf"
-        empty_stream = b""
         objects = [
             b"1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
             b"2 0 obj\n<< /Type /Pages /Kids [3 0 R] /Count 1 >>\nendobj\n",
@@ -453,7 +449,7 @@ class TestProvenanceAndIntegrity:
 
         assert run1.source_record.source_id == run2.source_record.source_id
         assert len(run1.observations) == len(run2.observations)
-        for o1, o2 in zip(run1.observations, run2.observations):
+        for o1, o2 in zip(run1.observations, run2.observations, strict=True):
             assert o1.observation_id == o2.observation_id
             assert o1.source_id == run1.source_record.source_id
 

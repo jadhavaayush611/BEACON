@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "beacon"
-version = "0.4.0"
+version = "1.0.0"
 description = "Multi-Format Disaster Intelligence Data Engineering Pipeline"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -16,9 +16,36 @@ dependencies = [
     "pillow>=10.0.0",
     "sqlalchemy>=2.0.0",
     "psycopg[binary]>=3.1.0",
+    "streamlit>=1.39.0",
+    "pandas>=2.0.0",
 ]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "ruff>=0.4.0",
+]
+
+[project.scripts]
+beacon-dashboard = "beacon.dashboard.cli:main"
 
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
 pythonpath = ["src", "."]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes (syntax, undefined names, unused imports)
+    "B",   # flake8-bugbear (common bug patterns)
+]
+ignore = [
+    "E501",  # Line length handled flexibly for long comments, URLs, and docstrings
+    "B008",  # Function calls in argument defaults (e.g. Pydantic Field)
+]

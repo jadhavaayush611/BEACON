@@ -1,6 +1,5 @@
 """Data Quality validation rules for BEACON observations."""
 
-from datetime import datetime, timezone
 from typing import Optional
 
 from beacon.models import (

@@ -10,8 +10,12 @@ from beacon.storage.connection import (
 from beacon.storage.repository import StorageRepository
 from beacon.storage.schema import (
     Base,
+    EventModel,
+    EventObservationModel,
+    MergeCandidateModel,
     ObservationModel,
     QualityResultModel,
+    ResolutionDecisionModel,
     SourceModel,
 )
 
@@ -20,6 +24,10 @@ __all__ = [
     "SourceModel",
     "ObservationModel",
     "QualityResultModel",
+    "EventModel",
+    "EventObservationModel",
+    "ResolutionDecisionModel",
+    "MergeCandidateModel",
     "create_db_engine",
     "get_session_factory",
     "get_session",

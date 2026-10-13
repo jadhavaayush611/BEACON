@@ -1,6 +1,7 @@
 """Structured results and audit metrics for the BEACON ETL pipeline."""
 
 from datetime import datetime, timezone
+from typing import Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -27,6 +28,9 @@ class ETLPipelineResult(BaseModel):
     observations_accepted: int = Field(default=0, description="Total observations passing data quality")
     observations_rejected: int = Field(default=0, description="Total observations failing data quality")
     records_persisted: int = Field(default=0, description="Total observation records committed to storage")
+    events_synthesized: int = Field(default=0, description="Total unified events created or updated through resolution")
+    events_persisted: int = Field(default=0, description="Total unified event records committed to storage")
+    resolution_summary: Optional[dict] = Field(default=None, description="Summary details of event resolution")
 
     storage_enabled: bool = Field(default=False, description="Whether database storage was enabled/configured")
     quality_report: QualityReport = Field(

@@ -86,7 +86,7 @@ class TestStorageRepositoryUnit:
         engine = create_engine("sqlite:///:memory:")
         init_db(engine)
         # Verify tables exist by inspecting schema
-        with engine.connect() as conn:
+        with engine.connect():
             # Querying tables directly should succeed without error
             pass
         drop_db(engine)

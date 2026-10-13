@@ -8,7 +8,6 @@ from beacon.models import DisasterObservation
 from beacon.resolution.models import (
     CandidateMatch,
     DecisionType,
-    FeatureScores,
     MergeCandidate,
     ResolutionOutcome,
 )

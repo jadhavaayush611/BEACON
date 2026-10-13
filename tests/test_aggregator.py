@@ -3,7 +3,7 @@
 from datetime import datetime, timezone
 import pytest
 
-from beacon.models import DisasterObservation, UnifiedDisasterEvent
+from beacon.models import DisasterObservation
 from beacon.resolution.aggregator import EventProfileAggregator
 
 

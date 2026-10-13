@@ -38,7 +38,7 @@ from beacon.resolution import (
 )
 from beacon.storage import StorageRepository, create_db_engine, get_session, get_session_factory, init_db
 
-__version__ = "0.4.0"
+__version__ = "1.0.0"
 
 __all__ = [
     "__version__",
