@@ -241,3 +241,107 @@ class TestEndToEndPipeline:
 
         # Event count must remain identical (no duplicated ghost events)
         assert count_ev_1 == count_ev_2
+
+    def test_e2e_repeat_pipeline_idempotency_all_sample_formats(
+        self, db_session_factory: sessionmaker
+    ) -> None:
+        """Verify repeated execution over all 5 heterogeneous sample files produces stable records.
+
+        Asserts that observations, events, and event-observation link counts remain strictly
+        identical without ghost duplication across multiple identical runs.
+        """
+        sample_files = [
+            Path("data/sample/events.json"),
+            Path("data/sample/events.csv"),
+            Path("data/sample/events.txt"),
+            Path("data/sample/sample_report.pdf"),
+            Path("data/sample/sample_disaster.png"),
+        ]
+        if not all(p.exists() for p in sample_files):
+            pytest.skip("Standard sample files not available")
+
+        from sqlalchemy import select
+        from beacon.storage import EventModel, EventObservationModel, ObservationModel
+
+        runner = ETLRunner(session_factory=db_session_factory)
+
+        # Run 1: initial ingestion & resolution
+        res1 = runner.run_complete_pipeline(sample_files)
+        assert res1.files_succeeded == 5
+        assert res1.observations_accepted == 10
+        assert res1.events_synthesized == 7
+
+        with db_session_factory() as session:
+            obs_1 = sorted(session.execute(select(ObservationModel.observation_id)).scalars().all())
+            ev_1 = sorted(session.execute(select(EventModel.event_id, EventModel.start_time)).all())
+            links_1 = sorted(session.execute(select(EventObservationModel.event_id, EventObservationModel.observation_id)).all())
+
+        assert len(obs_1) == 10
+        assert len(ev_1) == 7
+        assert len(links_1) == 10
+
+        # Run 2: repeat execution with exact same files
+        res2 = runner.run_complete_pipeline(sample_files)
+        assert res2.files_succeeded == 5
+
+        with db_session_factory() as session:
+            obs_2 = sorted(session.execute(select(ObservationModel.observation_id)).scalars().all())
+            ev_2 = sorted(session.execute(select(EventModel.event_id, EventModel.start_time)).all())
+            links_2 = sorted(session.execute(select(EventObservationModel.event_id, EventObservationModel.observation_id)).all())
+
+        assert len(obs_2) == 10
+        assert len(ev_2) == 7
+        assert len(links_2) == 10
+        # Assert complete record identity stability
+        assert obs_2 == obs_1
+        assert ev_2 == ev_1
+        assert links_2 == links_1
+
+        # Run 3: third execution to confirm sustained idempotency
+        runner.run_complete_pipeline(sample_files)
+        with db_session_factory() as session:
+            obs_3 = sorted(session.execute(select(ObservationModel.observation_id)).scalars().all())
+            ev_3 = sorted(session.execute(select(EventModel.event_id, EventModel.start_time)).all())
+            links_3 = sorted(session.execute(select(EventObservationModel.event_id, EventObservationModel.observation_id)).all())
+
+        assert len(obs_3) == 10
+        assert len(ev_3) == 7
+        assert len(links_3) == 10
+        assert obs_3 == obs_1
+        assert ev_3 == ev_1
+        assert links_3 == links_1
+
+    def test_e2e_in_memory_repeat_pipeline_idempotency_all_sample_formats(self) -> None:
+        """Verify repeated execution in in-memory mode preserves identical counts across all 5 files."""
+        sample_files = [
+            Path("data/sample/events.json"),
+            Path("data/sample/events.csv"),
+            Path("data/sample/events.txt"),
+            Path("data/sample/sample_report.pdf"),
+            Path("data/sample/sample_disaster.png"),
+        ]
+        if not all(p.exists() for p in sample_files):
+            pytest.skip("Standard sample files not available")
+
+        service = DashboardService(settings=Settings(database_url=None), session_factory=None)
+
+        # Run 1
+        service.run_pipeline_on_paths(sample_files, enable_resolution=True, persist_db=False)
+        obs_1 = len(service._in_memory_observations)
+        ev_1 = len(service._in_memory_events)
+        assert obs_1 == 10
+        assert ev_1 == 7
+
+        # Run 2
+        service.run_pipeline_on_paths(sample_files, enable_resolution=True, persist_db=False)
+        obs_2 = len(service._in_memory_observations)
+        ev_2 = len(service._in_memory_events)
+        assert obs_2 == 10
+        assert ev_2 == 7
+
+        # Run 3
+        service.run_pipeline_on_paths(sample_files, enable_resolution=True, persist_db=False)
+        obs_3 = len(service._in_memory_observations)
+        ev_3 = len(service._in_memory_events)
+        assert obs_3 == 10
+        assert ev_3 == 7

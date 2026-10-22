@@ -8,6 +8,11 @@ import streamlit as st
 
 from beacon.analytics.models import AnalyticsFilter
 from beacon.config import get_settings
+from beacon.dashboard.formatters import (
+    format_compression_ratio,
+    format_decision_row,
+    format_observation_row,
+)
 from beacon.dashboard.services import DashboardService
 from beacon.models import STANDARD_EVENT_TYPES, SeverityLevel
 
@@ -95,7 +100,7 @@ with tab_overview:
     with c4:
         st.metric(
             label="Compression Ratio",
-            value=f"{overview['compression_ratio']:.2f}x",
+            value=format_compression_ratio(overview.get("compression_ratio")),
             help="Ratio of raw observations consolidated per unified event",
         )
 
@@ -107,9 +112,10 @@ with tab_overview:
         st.subheader("Data Validation & Multi-Source Trust")
         multi_count = overview["multi_source_events_count"]
         total_ev = overview["events_count"]
-        multi_pct = overview["multi_source_ratio"] * 100
+        multi_ratio = overview.get("multi_source_ratio") or 0.0
+        multi_pct = multi_ratio * 100
 
-        st.progress(overview["multi_source_ratio"], text=f"Multi-Source Corroboration: {multi_pct:.1f}%")
+        st.progress(multi_ratio, text=f"Multi-Source Corroboration: {multi_pct:.1f}%")
         st.write(
             f"**{multi_count}** of **{total_ev}** events are corroborated by "
             f"two or more independent reporting channels."
@@ -313,7 +319,8 @@ with tab_events:
                 with ec1:
                     st.write(f"**Summary:** {ev.summary}")
                     st.write(f"**Severity:** `{ev.severity or 'unspecified'}`")
-                    st.write(f"**Start Time:** `{ev.start_time.isoformat()}`")
+                    start_disp = ev.start_time.isoformat() if ev.start_time else "N/A"
+                    st.write(f"**Start Time:** `{start_disp}`")
                     if ev.end_time:
                         st.write(f"**End Time:** `{ev.end_time.isoformat()}`")
                     st.write(f"**Sources Linked:** `{', '.join(ev.source_ids)}`")
@@ -322,9 +329,15 @@ with tab_events:
                 with ec2:
                     centroid = (ev.metadata or {}).get("centroid")
                     bbox = (ev.metadata or {}).get("bounding_box")
-                    if centroid:
+                    if centroid and centroid.get("latitude") is not None and centroid.get("longitude") is not None:
                         st.write(f"**Centroid:** `{centroid['latitude']}, {centroid['longitude']}`")
-                    if bbox:
+                    if (
+                        bbox
+                        and bbox.get("min_latitude") is not None
+                        and bbox.get("max_latitude") is not None
+                        and bbox.get("min_longitude") is not None
+                        and bbox.get("max_longitude") is not None
+                    ):
                         st.write("**Bounding Box:**")
                         st.caption(f"Lat: [{bbox['min_latitude']}, {bbox['max_latitude']}]")
                         st.caption(f"Lon: [{bbox['min_longitude']}, {bbox['max_longitude']}]")
@@ -349,32 +362,12 @@ with tab_events:
                 detail = service.get_event_detail(ev.event_id)
                 if detail and detail.get("observations"):
                     st.markdown("##### 📄 Constituent Observations")
-                    obs_rows = [
-                        {
-                            "Obs ID": o.observation_id,
-                            "Source ID": o.source_id,
-                            "Type": o.event_type,
-                            "Location": o.location,
-                            "Severity": o.severity,
-                            "Coordinates": f"({o.latitude}, {o.longitude})" if o.latitude is not None else "None",
-                            "Timestamp": o.event_time.isoformat() if o.event_time else "None",
-                            "Confidence": f"{o.extraction_confidence:.2f}",
-                        }
-                        for o in detail["observations"]
-                    ]
+                    obs_rows = [format_observation_row(o) for o in detail["observations"]]
                     st.dataframe(obs_rows, width="stretch")
 
                 if detail and detail.get("decisions"):
                     st.markdown("##### ⚖️ Resolution Match Decisions")
-                    dec_rows = [
-                        {
-                            "Obs ID": d["observation_id"],
-                            "Decision": d["decision_type"],
-                            "Score": f"{d['composite_score']:.3f}",
-                            "Rationale": d["rationale"],
-                        }
-                        for d in detail["decisions"]
-                    ]
+                    dec_rows = [format_decision_row(d) for d in detail["decisions"]]
                     st.dataframe(dec_rows, width="stretch")
     else:
         st.info("No unified events match the current filter criteria.")
@@ -391,7 +384,7 @@ with tab_analytics:
     a1, a2, a3 = st.columns(3)
     a1.metric("Total Events", summary.total_events)
     a2.metric("Total Observations", summary.total_observations)
-    a3.metric("Compression Ratio", f"{summary.compression_ratio:.2f}x")
+    a3.metric("Compression Ratio", format_compression_ratio(summary.compression_ratio))
 
     st.markdown("---")
     d1, d2 = st.columns(2)

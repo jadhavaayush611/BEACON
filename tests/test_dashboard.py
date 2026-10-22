@@ -12,6 +12,15 @@ from sqlalchemy.orm import sessionmaker
 
 from beacon.analytics.models import AnalyticsFilter
 from beacon.config import Settings
+from beacon.dashboard.formatters import (
+    format_compression_ratio,
+    format_confidence,
+    format_coordinates,
+    format_decision_row,
+    format_observation_row,
+    format_score,
+    format_timestamp,
+)
 from beacon.dashboard.services import DashboardService
 from beacon.models import (
     DisasterObservation,
@@ -346,3 +355,173 @@ class TestDashboardService:
         at = AppTest.from_file(str(app_path), default_timeout=15)
         at.run()
         assert not at.exception
+
+    def test_get_event_detail_preserves_none_confidence_from_db(
+        self, dashboard_service: DashboardService, sample_events: list[UnifiedDisasterEvent]
+    ) -> None:
+        """Loading event detail from DB preserves None extraction_confidence without fabricating 0.0."""
+        repo = StorageRepository()
+        src = SourceRecord(
+            source_id="src_d_none",
+            source_file="none.json",
+            source_type=SourceType.JSON,
+            extraction_method=ExtractionMethod.JSON_PARSE,
+            ingested_at=datetime.now(timezone.utc),
+            extraction_status=ExtractionStatus.SUCCESS,
+            content_hash="e" * 64,
+        )
+        obs = DisasterObservation(
+            observation_id="obs_d_none",
+            source_id="src_d_none",
+            event_type="flood",
+            location="Riverside Metro",
+            extraction_confidence=None,
+        )
+        with dashboard_service.session_factory() as session:
+            repo.save_source(src, session)
+            repo.save_observations([obs], session)
+            repo.save_event(sample_events[0], session)
+            repo.link_observation_to_event(sample_events[0].event_id, obs.observation_id, 0.95, session)
+            session.commit()
+
+        detail = dashboard_service.get_event_detail("evt_dash_01")
+        assert detail is not None
+        matched_obs = next(o for o in detail["observations"] if o.observation_id == "obs_d_none")
+        assert matched_obs.extraction_confidence is None
+
+    def test_app_headless_runs_complete_pipeline_without_exception(self) -> None:
+        """Verify dashboard runs complete sample pipeline and renders all views safely."""
+        from streamlit.testing.v1 import AppTest
+
+        app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
+        at = AppTest.from_file(str(app_path), default_timeout=30)
+        at.run()
+
+        run_btns = [b for b in at.button if "Run Complete Pipeline" in b.label]
+        assert len(run_btns) == 1
+        run_btns[0].click().run()
+
+        assert len(at.exception) == 0
+
+        # Check that dataframes render without exception and display N/A for None confidence
+        dfs = at.dataframe
+        assert len(dfs) > 0
+        found_na_confidence = False
+        found_numeric_confidence = False
+        for df in dfs:
+            val = df.value
+            if "Confidence" in val.columns:
+                for conf in val["Confidence"]:
+                    if conf == "N/A":
+                        found_na_confidence = True
+                    elif isinstance(conf, str) and "." in conf:
+                        found_numeric_confidence = True
+        assert found_na_confidence, "Expected at least one observation with 'N/A' confidence"
+        assert found_numeric_confidence, "Expected at least one observation with formatted numeric confidence"
+
+
+class TestDashboardFormatters:
+    """Unit tests for dashboard formatting and nullable rendering helpers."""
+
+    def test_format_confidence_numeric_preserved(self) -> None:
+        """Numeric confidence values retain expected two-decimal formatting."""
+        assert format_confidence(0.95) == "0.95"
+        assert format_confidence(0.7) == "0.70"
+        assert format_confidence(1.0) == "1.00"
+        assert format_confidence(0.0) == "0.00"
+        assert format_confidence(0.12345) == "0.12"
+
+    def test_format_confidence_none_is_honest(self) -> None:
+        """Missing confidence is displayed explicitly as 'N/A' without fabricating 0.0."""
+        assert format_confidence(None) == "N/A"
+        assert format_confidence(None) != "0"
+        assert format_confidence(None) != "0.0"
+        assert format_confidence(None) != "0.00"
+
+    def test_format_coordinates(self) -> None:
+        """Coordinates format properly when present and yield 'N/A' when missing."""
+        assert format_coordinates(34.05, -118.25) == "(34.05, -118.25)"
+        assert format_coordinates(None, -118.25) == "N/A"
+        assert format_coordinates(34.05, None) == "N/A"
+        assert format_coordinates(None, None) == "N/A"
+
+    def test_format_timestamp(self) -> None:
+        """Timestamps format as ISO-8601 when present and yield 'N/A' when missing."""
+        dt = datetime(2026, 10, 12, 8, 30, tzinfo=timezone.utc)
+        assert format_timestamp(dt) == "2026-10-12T08:30:00+00:00"
+        assert format_timestamp(None) == "N/A"
+
+    def test_format_score(self) -> None:
+        """Scores format to 3 decimals or 'N/A' if missing."""
+        assert format_score(0.8526) == "0.853"
+        assert format_score(0.0) == "0.000"
+        assert format_score(None) == "N/A"
+
+    def test_format_compression_ratio(self) -> None:
+        """Compression ratio formats to 2 decimals with suffix 'x' or 'N/A'."""
+        assert format_compression_ratio(1.428) == "1.43x"
+        assert format_compression_ratio(0.0) == "0.00x"
+        assert format_compression_ratio(None) == "N/A"
+
+    def test_format_observation_row_fully_populated(self) -> None:
+        """Fully populated observation produces complete formatted dictionary."""
+        obs = DisasterObservation(
+            observation_id="obs_full",
+            source_id="src_full",
+            event_type="flood",
+            location="Riverside",
+            severity="severe",
+            latitude=34.05,
+            longitude=-118.25,
+            event_time=datetime(2026, 10, 12, 8, 0, tzinfo=timezone.utc),
+            extraction_confidence=0.92,
+        )
+        row = format_observation_row(obs)
+        assert row["Obs ID"] == "obs_full"
+        assert row["Source ID"] == "src_full"
+        assert row["Type"] == "flood"
+        assert row["Location"] == "Riverside"
+        assert row["Severity"] == "severe"
+        assert row["Coordinates"] == "(34.05, -118.25)"
+        assert row["Timestamp"] == "2026-10-12T08:00:00+00:00"
+        assert row["Confidence"] == "0.92"
+
+    def test_format_observation_row_all_nullables(self) -> None:
+        """Observation with missing optional fields produces safe 'N/A' entries without raising exceptions."""
+        obs = DisasterObservation(
+            observation_id="obs_nulls",
+            source_id="src_nulls",
+            event_type="wildfire",
+            location=None,
+            severity=None,
+            latitude=None,
+            longitude=None,
+            event_time=None,
+            extraction_confidence=None,
+        )
+        row = format_observation_row(obs)
+        assert row["Obs ID"] == "obs_nulls"
+        assert row["Source ID"] == "src_nulls"
+        assert row["Type"] == "wildfire"
+        assert row["Location"] == "N/A"
+        assert row["Severity"] == "unspecified"
+        assert row["Coordinates"] == "N/A"
+        assert row["Timestamp"] == "N/A"
+        assert row["Confidence"] == "N/A"
+
+    def test_format_decision_row_handles_nullables(self) -> None:
+        """Decision row formats score and rationale safely with missing values."""
+        row_pop = format_decision_row({
+            "observation_id": "obs_01",
+            "decision_type": "match",
+            "composite_score": 0.888,
+            "rationale": "Matched location and time",
+        })
+        assert row_pop["Score"] == "0.888"
+        assert row_pop["Rationale"] == "Matched location and time"
+
+        row_empty = format_decision_row({})
+        assert row_empty["Obs ID"] == "N/A"
+        assert row_empty["Decision"] == "N/A"
+        assert row_empty["Score"] == "N/A"
+        assert row_empty["Rationale"] == "N/A"

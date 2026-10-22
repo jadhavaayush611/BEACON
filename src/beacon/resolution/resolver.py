@@ -20,6 +20,23 @@ from beacon.resolution.policy import MatchPolicy
 logger = logging.getLogger("beacon.resolution.resolver")
 
 
+class AmbiguousObservationAssociationError(ValueError):
+    """Raised when an observation is inconsistently associated with multiple unified events."""
+
+    def __init__(self, ambiguous_associations: dict[str, set[str]]) -> None:
+        self.ambiguous_associations = {
+            oid: sorted(list(eids)) for oid, eids in ambiguous_associations.items()
+        }
+        details = "; ".join(
+            f"observation '{oid}' is linked to multiple events: {', '.join(sorted(list(eids)))}"
+            for oid, eids in sorted(ambiguous_associations.items())
+        )
+        super().__init__(
+            f"Data integrity violation: ambiguous observation associations detected ({details}). "
+            f"An observation must not belong to multiple distinct events."
+        )
+
+
 class EventResolver:
     """Orchestrates candidate generation, feature comparison, decision policy, and profile aggregation."""
 
@@ -64,6 +81,21 @@ class EventResolver:
             for eid, obs_list in existing_event_observations.items():
                 obs_by_event[eid] = list(obs_list)
 
+        # Index existing associations between observation IDs and unified events for idempotency
+        obs_to_event_id: dict[str, str] = {}
+        ambiguous_associations: dict[str, set[str]] = {}
+        for eid, ev in events_by_id.items():
+            for oid in ev.observation_ids:
+                if oid in obs_to_event_id:
+                    existing_eid = obs_to_event_id[oid]
+                    if existing_eid != eid:
+                        ambiguous_associations.setdefault(oid, {existing_eid}).add(eid)
+                else:
+                    obs_to_event_id[oid] = eid
+
+        if ambiguous_associations:
+            raise AmbiguousObservationAssociationError(ambiguous_associations)
+
         outcomes: list[ResolutionOutcome] = []
         all_merge_candidates: list[MergeCandidate] = []
         events_created_count = 0
@@ -72,6 +104,47 @@ class EventResolver:
         assigned_count = 0
 
         for obs in observations:
+            # Check if observation is already part of an existing event (idempotent re-observation)
+            if obs.observation_id in obs_to_event_id:
+                target_event_id = obs_to_event_id[obs.observation_id]
+                target_event = events_by_id[target_event_id]
+
+                cluster = obs_by_event.setdefault(target_event_id, [])
+                existing_idx = next(
+                    (i for i, o in enumerate(cluster) if o.observation_id == obs.observation_id),
+                    None,
+                )
+                if existing_idx is not None:
+                    cluster[existing_idx] = obs
+                else:
+                    cluster.append(obs)
+
+                # Re-synthesize profile if cluster is complete or observation has updated attributes
+                if len(cluster) >= len(target_event.observation_ids):
+                    updated_event = self.aggregator.synthesize(cluster, existing_event=target_event)
+                    events_by_id[target_event_id] = updated_event
+
+                # Calculate genuine spatiotemporal match score against target event without fabrication
+                feat_scores = self.matcher.compare(obs, target_event)
+
+                outcome = ResolutionOutcome(
+                    observation_id=obs.observation_id,
+                    assigned_event_id=target_event_id,
+                    decision=DecisionType.IDEMPOTENT_RE_OBSERVATION,
+                    score=feat_scores.composite_score,
+                    feature_scores=feat_scores,
+                    is_new_event=False,
+                    rationale=(
+                        f"Idempotent re-observation: observation '{obs.observation_id}' is already "
+                        f"associated with unified event '{target_event_id}'. "
+                        f"Spatiotemporal evidence score: {feat_scores.composite_score:.3f}."
+                    ),
+                )
+                events_updated_count += 1
+                assigned_count += 1
+                outcomes.append(outcome)
+                continue
+
             # 1. Blocking & Candidate Generation
             candidate_events = self.candidate_generator.generate_candidates(
                 obs, events_by_id.values()
@@ -121,6 +194,7 @@ class EventResolver:
                 # Re-synthesize unified profile
                 updated_event = self.aggregator.synthesize(cluster, existing_event=target_event)
                 events_by_id[target_event_id] = updated_event
+                obs_to_event_id[obs.observation_id] = target_event_id
                 events_updated_count += 1
                 assigned_count += 1
 
@@ -130,6 +204,7 @@ class EventResolver:
                 events_by_id[new_event.event_id] = new_event
                 obs_by_event[new_event.event_id] = [obs]
 
+                obs_to_event_id[obs.observation_id] = new_event.event_id
                 outcome.assigned_event_id = new_event.event_id
                 events_created_count += 1
                 assigned_count += 1
@@ -151,6 +226,7 @@ class EventResolver:
                     events_by_id[target_event_id] = self.aggregator.synthesize(
                         cluster, existing_event=target_event
                     )
+                    obs_to_event_id[obs.observation_id] = target_event_id
                     events_updated_count += 1
                     assigned_count += 1
 

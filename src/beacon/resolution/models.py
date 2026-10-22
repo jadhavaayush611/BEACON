@@ -14,6 +14,7 @@ class DecisionType(str, Enum):
     AMBIGUOUS_CANDIDATE = "ambiguous_candidate"
     NO_MATCH = "no_match"
     MERGE_CANDIDATE = "merge_candidate"
+    IDEMPOTENT_RE_OBSERVATION = "idempotent_re_observation"
 
 
 class FeatureScores(BaseModel):

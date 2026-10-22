@@ -6,8 +6,10 @@ import pytest
 
 from beacon.config import Settings
 from beacon.ingestion import ingest_file
-from beacon.models import DisasterObservation
+from beacon.models import DisasterObservation, UnifiedDisasterEvent
 from beacon.pipeline.transform import ObservationTransformer
+from beacon.resolution.models import DecisionType
+from beacon.resolution.resolver import AmbiguousObservationAssociationError
 from beacon.resolution.resolver import EventResolver
 
 SAMPLE_DIR = Path(__file__).parent.parent / "data" / "sample"
@@ -227,3 +229,262 @@ class TestEventResolver:
         # Centroid updated using corrected obs1 coordinates: (34.0600 + 34.0520) / 2 = 34.0560
         centroid = updated_event.metadata.get("centroid", {})
         assert centroid.get("latitude") == 34.056
+
+    def test_unanchored_observation_processed_once_and_repeatedly(
+        self, resolver: EventResolver
+    ) -> None:
+        """Verify an unanchored observation creates one event and re-resolves idempotently."""
+        obs_unanchored = DisasterObservation(
+            observation_id="obs_unanchored_001",
+            source_id="src_txt_01",
+            event_type="wildfire",
+            location="North Forest Perimeter",
+            event_time=None,
+            latitude=None,
+            longitude=None,
+        )
+
+        # Run 1: initial resolution creates exactly one unified event
+        res1 = resolver.resolve_observations([obs_unanchored])
+        assert len(res1.resolved_events) == 1
+        assert res1.events_created == 1
+        assert res1.events_updated == 0
+        assert res1.observations_assigned == 1
+
+        initial_event = res1.resolved_events[0]
+        initial_event_id = initial_event.event_id
+        assert initial_event.observation_ids == ["obs_unanchored_001"]
+
+        # Run 2: repeat resolution with identical unanchored observation
+        res2 = resolver.resolve_observations(
+            [obs_unanchored],
+            existing_events=res1.resolved_events,
+        )
+
+        # Idempotency invariants: exactly 1 event, identical ID, zero duplicates
+        assert len(res2.resolved_events) == 1
+        assert res2.events_created == 0
+        assert res2.events_updated == 1
+        assert res2.observations_assigned == 1
+        assert res2.resolved_events[0].event_id == initial_event_id
+        assert res2.resolved_events[0].observation_ids == ["obs_unanchored_001"]
+        assert res2.outcomes[0].decision == DecisionType.IDEMPOTENT_RE_OBSERVATION
+        assert res2.outcomes[0].score <= 0.40  # Preserves conservative unanchored score cap
+        assert "Idempotent re-observation" in res2.outcomes[0].rationale
+
+    def test_different_unanchored_observations_remain_separate(
+        self, resolver: EventResolver
+    ) -> None:
+        """Verify distinct unanchored observations are never merged falsely without evidence."""
+        obs1 = DisasterObservation(
+            observation_id="obs_diff_unanchored_1",
+            source_id="src_01",
+            event_type="wildfire",
+            location="North Forest Perimeter",
+            event_time=None,
+            latitude=None,
+            longitude=None,
+        )
+        obs2 = DisasterObservation(
+            observation_id="obs_diff_unanchored_2",
+            source_id="src_02",
+            event_type="wildfire",
+            location="North Forest Perimeter",
+            event_time=None,
+            latitude=None,
+            longitude=None,
+        )
+
+        # Run 1: process obs1
+        res1 = resolver.resolve_observations([obs1])
+        assert len(res1.resolved_events) == 1
+        event1_id = res1.resolved_events[0].event_id
+
+        # Run 2: process obs2 with event1 existing
+        res2 = resolver.resolve_observations([obs2], existing_events=res1.resolved_events)
+
+        # Constraint: two distinct unanchored records must NOT merge based solely on text
+        assert len(res2.resolved_events) == 2
+        event_ids = {e.event_id for e in res2.resolved_events}
+        assert event1_id in event_ids
+        assert len(event_ids) == 2
+
+    def test_genuinely_new_observation_processed_with_existing_associations(
+        self, resolver: EventResolver
+    ) -> None:
+        """Verify new observations are properly resolved alongside idempotent re-observations."""
+        obs_existing = DisasterObservation(
+            observation_id="obs_exist_01",
+            source_id="src_01",
+            event_type="wildfire",
+            location="North Forest Perimeter",
+            event_time=None,
+            latitude=None,
+            longitude=None,
+        )
+        obs_new = DisasterObservation(
+            observation_id="obs_brand_new_02",
+            source_id="src_02",
+            event_type="flood",
+            location="Riverside Metro",
+            event_time=datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+            latitude=34.05,
+            longitude=-118.25,
+        )
+
+        res1 = resolver.resolve_observations([obs_existing])
+        assert len(res1.resolved_events) == 1
+        exist_eid = res1.resolved_events[0].event_id
+
+        # Batch contains existing re-observation AND brand new observation
+        res2 = resolver.resolve_observations(
+            [obs_existing, obs_new],
+            existing_events=res1.resolved_events,
+        )
+
+        assert len(res2.resolved_events) == 2
+        assert res2.events_created == 1
+        assert res2.events_updated == 1
+        assert res2.observations_assigned == 2
+
+        outcomes_by_obs = {o.observation_id: o for o in res2.outcomes}
+        assert outcomes_by_obs["obs_exist_01"].assigned_event_id == exist_eid
+        assert outcomes_by_obs["obs_exist_01"].decision == DecisionType.IDEMPOTENT_RE_OBSERVATION
+        assert outcomes_by_obs["obs_exist_01"].score <= 0.40
+        assert "Idempotent re-observation" in outcomes_by_obs["obs_exist_01"].rationale
+        assert outcomes_by_obs["obs_brand_new_02"].is_new_event
+
+    def test_ambiguous_observation_association_across_multiple_events_raises_error(
+        self, resolver: EventResolver
+    ) -> None:
+        """Verify an observation associated with multiple distinct events raises an integrity error."""
+        now = datetime.now(timezone.utc)
+        ev1 = UnifiedDisasterEvent(
+            event_id="evt_01",
+            event_type="wildfire",
+            location="Perimeter A",
+            start_time=now,
+            summary="Event 1",
+            observation_ids=["obs_shared_01"],
+            created_at=now,
+            updated_at=now,
+        )
+        ev2 = UnifiedDisasterEvent(
+            event_id="evt_02",
+            event_type="wildfire",
+            location="Perimeter B",
+            start_time=now,
+            summary="Event 2",
+            observation_ids=["obs_shared_01"],
+            created_at=now,
+            updated_at=now,
+        )
+        obs = DisasterObservation(
+            observation_id="obs_shared_01",
+            source_id="src_01",
+            event_type="wildfire",
+            location="Perimeter A",
+        )
+
+        import pytest
+        with pytest.raises(AmbiguousObservationAssociationError) as exc_info:
+            resolver.resolve_observations([obs], existing_events=[ev1, ev2])
+
+        err = exc_info.value
+        assert "obs_shared_01" in err.ambiguous_associations
+        assert set(err.ambiguous_associations["obs_shared_01"]) == {"evt_01", "evt_02"}
+        assert "Data integrity violation" in str(err)
+
+    def test_duplicate_observation_links_within_same_event_is_handled_safely(
+        self, resolver: EventResolver
+    ) -> None:
+        """Verify duplicate references to an observation within the same event are handled cleanly."""
+        now = datetime.now(timezone.utc)
+        ev1 = UnifiedDisasterEvent(
+            event_id="evt_single_01",
+            event_type="flood",
+            location="Riverside",
+            start_time=now,
+            summary="Single Event",
+            observation_ids=["obs_dup_within_01", "obs_dup_within_01"],  # Duplicate within same event
+            created_at=now,
+            updated_at=now,
+        )
+        obs = DisasterObservation(
+            observation_id="obs_dup_within_01",
+            source_id="src_01",
+            event_type="flood",
+            location="Riverside",
+            latitude=34.05,
+            longitude=-118.25,
+            event_time=now,
+        )
+
+        # Must NOT raise AmbiguousObservationAssociationError because both links belong to evt_single_01
+        res = resolver.resolve_observations([obs], existing_events=[ev1])
+        assert len(res.resolved_events) == 1
+        assert res.resolved_events[0].event_id == "evt_single_01"
+        assert res.outcomes[0].decision == DecisionType.IDEMPOTENT_RE_OBSERVATION
+
+    def test_distinguish_idempotent_reobservation_from_confident_match(
+        self, resolver: EventResolver
+    ) -> None:
+        """Verify idempotent re-observations are distinct from genuine spatiotemporal confident matches."""
+        t0 = datetime(2026, 6, 1, 10, 0, 0, tzinfo=timezone.utc)
+        obs_anchored_1 = DisasterObservation(
+            observation_id="obs_anc_01",
+            source_id="src_sensor_01",
+            event_type="flood",
+            location="Downtown Bayview",
+            latitude=37.7749,
+            longitude=-122.4194,
+            event_time=t0,
+        )
+        obs_anchored_2 = DisasterObservation(
+            observation_id="obs_anc_02",
+            source_id="src_sensor_02",
+            event_type="flood",
+            location="Downtown Bayview",
+            latitude=37.7750,
+            longitude=-122.4195,
+            event_time=t0,
+        )
+        obs_unanchored = DisasterObservation(
+            observation_id="obs_unanc_01",
+            source_id="src_txt_01",
+            event_type="wildfire",
+            location="North Basin",
+            latitude=None,
+            longitude=None,
+            event_time=None,
+        )
+
+        # 1. Initial resolution: obs_anchored_1 creates Event A, obs_unanchored creates Event B
+        res1 = resolver.resolve_observations([obs_anchored_1, obs_unanchored])
+        assert len(res1.resolved_events) == 2
+        assert res1.outcomes[0].decision == DecisionType.NO_MATCH  # Created event
+        assert res1.outcomes[1].decision == DecisionType.NO_MATCH  # Created event
+
+        # 2. Second resolution:
+        # - obs_anchored_2 is a NEW observation that spatiotemporally matches Event A
+        # - obs_anchored_1 is an IDEMPOTENT re-observation of Event A
+        # - obs_unanchored is an IDEMPOTENT re-observation of Event B
+        res2 = resolver.resolve_observations(
+            [obs_anchored_2, obs_anchored_1, obs_unanchored],
+            existing_events=res1.resolved_events,
+        )
+
+        outcomes = {o.observation_id: o for o in res2.outcomes}
+
+        # Genuine spatiotemporal match
+        assert outcomes["obs_anc_02"].decision == DecisionType.CONFIDENT_MATCH
+        assert outcomes["obs_anc_02"].score >= 0.80
+
+        # Idempotent re-observation of anchored record
+        assert outcomes["obs_anc_01"].decision == DecisionType.IDEMPOTENT_RE_OBSERVATION
+        assert outcomes["obs_anc_01"].score >= 0.80  # Genuine spatiotemporal score against its own event
+
+        # Idempotent re-observation of unanchored record: PRESERVES 0.40 CAP
+        assert outcomes["obs_unanc_01"].decision == DecisionType.IDEMPOTENT_RE_OBSERVATION
+        assert outcomes["obs_unanc_01"].score <= 0.40  # Must NEVER be fabricated as 1.0!
+        assert "0.400" in outcomes["obs_unanc_01"].rationale

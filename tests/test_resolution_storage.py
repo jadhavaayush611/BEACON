@@ -1,6 +1,6 @@
 """Unit tests for StorageRepository Phase 4 resolution and event operations."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import pytest
 from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
@@ -244,3 +244,140 @@ class TestStorageResolutionUnit:
         mem_session.commit()
         assert second_link.id == first_link.id
         assert second_link.confidence_score == 0.95
+
+    def test_over_100_events_unpaginated_resolution_preserves_associations(
+        self, mem_session: Session
+    ) -> None:
+        """Verify resolution has access to every existing event beyond the default 100 limit.
+
+        Proves that:
+        1. list_events() with default limit=100 omits later events.
+        2. get_all_events_with_observations() loads all events without pagination cutoff.
+        3. Observations linked to events past index 100 are recognized idempotently rather
+           than fabricating ghost events.
+        """
+        from beacon.models import DisasterObservation
+        from beacon.resolution.resolver import EventResolver
+
+        repo = StorageRepository()
+        t0 = datetime(2026, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
+
+        # Create 105 events in descending start_time order
+        # Event 104 (the 105th event) has the oldest start_time and appears past index 100
+        for i in range(105):
+            ev_time = t0 + timedelta(hours=i)
+            ev = UnifiedDisasterEvent(
+                event_id=f"evt_batch_{i:03d}",
+                event_type="flood",
+                location=f"District {i:03d}",
+                start_time=ev_time,
+                summary=f"Event {i:03d}",
+                observation_ids=[f"obs_batch_{i:03d}"],
+                created_at=ev_time,
+                updated_at=ev_time,
+            )
+            repo.save_event(ev, mem_session)
+            obs = DisasterObservation(
+                observation_id=f"obs_batch_{i:03d}",
+                source_id=f"src_{i:03d}",
+                event_type="flood",
+                location=f"District {i:03d}",
+                event_time=ev_time,
+            )
+            repo.save_observations([obs], mem_session)
+            repo.link_observation_to_event(ev.event_id, obs.observation_id, 0.9, mem_session)
+
+        mem_session.commit()
+
+        # 1. Verify default list_events(limit=100) truncates to 100 events
+        truncated_events = repo.list_events(mem_session)
+        assert len(truncated_events) == 100
+        truncated_ids = {e.event_id for e in truncated_events}
+        # The oldest event (evt_batch_000) is on page 2 and omitted under limit=100
+        assert "evt_batch_000" not in truncated_ids
+
+        # 2. Verify get_all_events_with_observations() loads all 105 events
+        all_events, all_obs_map = repo.get_all_events_with_observations(mem_session)
+        assert len(all_events) == 105
+        assert "evt_batch_000" in {e.event_id for e in all_events}
+        assert len(all_obs_map["evt_batch_000"]) == 1
+
+        # 3. Verify resolving an observation linked to the 105th event:
+        # Under old default limit behavior (only truncated_events passed):
+        resolver = EventResolver()
+        target_obs = DisasterObservation(
+            observation_id="obs_batch_000",
+            source_id="src_000",
+            event_type="flood",
+            location="District 000",
+            event_time=t0,
+        )
+
+        res_truncated = resolver.resolve_observations(
+            [target_obs],
+            existing_events=truncated_events,
+        )
+        # Failure case under old default limit behavior:
+        # evt_batch_000 was omitted from existing_events, so target_obs is NOT recognized as
+        # an idempotent re-observation of its own event.
+        assert res_truncated.outcomes[0].assigned_event_id != "evt_batch_000"
+        assert res_truncated.outcomes[0].decision != DecisionType.IDEMPOTENT_RE_OBSERVATION
+
+        # Under new unpaginated behavior:
+        res_full = resolver.resolve_observations(
+            [target_obs],
+            existing_events=all_events,
+            existing_event_observations=all_obs_map,
+        )
+        # Success under new behavior: recognized as idempotent re-observation of evt_batch_000!
+        assert res_full.events_created == 0
+        assert res_full.events_updated == 1
+        assert len(res_full.resolved_events) == 105
+        assert res_full.outcomes[0].decision == DecisionType.IDEMPOTENT_RE_OBSERVATION
+        assert res_full.outcomes[0].assigned_event_id == "evt_batch_000"
+
+    def test_list_events_evaluates_get_event_exactly_once_per_record(
+        self, mem_session: Session
+    ) -> None:
+        """Verify list_events evaluates get_event exactly once per model record without redundant queries,
+        while preserving ordering, missing-record omission, and pagination limit."""
+        from unittest.mock import patch
+
+        repo = StorageRepository()
+
+        # Create 3 distinct events with staggered start timestamps
+        base_time = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        for i in range(3):
+            ev = UnifiedDisasterEvent(
+                event_id=f"evt_query_eff_{i}",
+                event_type="flood",
+                location="Riverfront",
+                start_time=base_time + timedelta(hours=i),
+                summary=f"Query efficiency test event {i}",
+                observation_ids=[f"obs_eff_{i}"],
+                created_at=base_time,
+                updated_at=base_time,
+            )
+            repo.save_event(ev, mem_session)
+        mem_session.commit()
+
+        call_count = 0
+        original_get_event = repo.get_event
+
+        def counting_get_event(event_id: str, session: Session):
+            nonlocal call_count
+            call_count += 1
+            # Simulate missing record for evt_query_eff_1
+            if event_id == "evt_query_eff_1":
+                return None
+            return original_get_event(event_id, session)
+
+        with patch.object(repo, "get_event", side_effect=counting_get_event):
+            results = repo.list_events(mem_session)
+
+        # Exactly 3 records fetched by query -> get_event evaluated exactly 3 times (never 6 times as under duplicate query bug)
+        assert call_count == 3, f"Expected get_event to be called exactly 3 times, was called {call_count} times"
+        # evt_query_eff_1 returned None so it must be omitted from results
+        assert len(results) == 2
+        # Ordering must be start_time desc: evt_query_eff_2 (hours=2), then evt_query_eff_0 (hours=0)
+        assert [r.event_id for r in results] == ["evt_query_eff_2", "evt_query_eff_0"]

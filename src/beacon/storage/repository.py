@@ -447,22 +447,43 @@ class StorageRepository:
     def list_events(
         self,
         session: Session,
-        limit: int = 100,
+        limit: Optional[int] = 100,
         offset: int = 0,
     ) -> list[UnifiedDisasterEvent]:
-        """List unified events ordered by start time descending."""
-        models = session.execute(
-            select(EventModel)
-            .order_by(EventModel.start_time.desc())
-            .limit(limit)
-            .offset(offset)
-        ).scalars().all()
+        """List unified events ordered by start time descending.
 
-        return [
-            self.get_event(m.event_id, session)  # type: ignore[misc]
-            for m in models
-            if self.get_event(m.event_id, session) is not None
-        ]
+        If limit is None, retrieves all unified events without pagination limits.
+        """
+        stmt = select(EventModel).order_by(EventModel.start_time.desc()).offset(offset)
+        if limit is not None:
+            stmt = stmt.limit(limit)
+
+        models = session.execute(stmt).scalars().all()
+
+        events: list[UnifiedDisasterEvent] = []
+        for m in models:
+            ev = self.get_event(m.event_id, session)
+            if ev is not None:
+                events.append(ev)
+        return events
+
+    def get_all_events(
+        self,
+        session: Session,
+    ) -> list[UnifiedDisasterEvent]:
+        """Retrieve every unified event in storage without pagination limits."""
+        return self.list_events(session, limit=None)
+
+    def get_all_events_with_observations(
+        self,
+        session: Session,
+    ) -> tuple[list[UnifiedDisasterEvent], dict[str, list[DisasterObservation]]]:
+        """Retrieve all events and their constituent observations without pagination limits."""
+        events = self.get_all_events(session)
+        obs_by_event: dict[str, list[DisasterObservation]] = {}
+        for ev in events:
+            obs_by_event[ev.event_id] = self.get_observations_for_event(ev.event_id, session)
+        return events, obs_by_event
 
     def get_observations_for_event(
         self,

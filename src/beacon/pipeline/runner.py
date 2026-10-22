@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from beacon.config import Settings, get_settings
 from beacon.ingestion import IngestionResult, ingest_file
-from beacon.models import DisasterObservation
+from beacon.models import DisasterObservation, UnifiedDisasterEvent
 from beacon.pipeline.result import ETLPipelineResult
 from beacon.pipeline.transform import ObservationTransformer
 from beacon.quality import DataQualityValidator, QualityReport
@@ -173,7 +173,23 @@ class ETLRunner:
                 "Resolving %d accepted observations into unified events",
                 len(quality_report.accepted_records),
             )
-            res_result = self.resolver.resolve_observations(quality_report.accepted_records)
+            existing_events: list[UnifiedDisasterEvent] = []
+            existing_event_obs: dict[str, list[DisasterObservation]] = {}
+            if storage_enabled:
+                assert self.session_factory is not None
+                try:
+                    with get_session(self.session_factory) as session:
+                        existing_events, existing_event_obs = (
+                            self.repository.get_all_events_with_observations(session)
+                        )
+                except Exception as ex_err:
+                    logger.warning("Could not load existing events from storage: %s", ex_err)
+
+            res_result = self.resolver.resolve_observations(
+                quality_report.accepted_records,
+                existing_events=existing_events,
+                existing_event_observations=existing_event_obs,
+            )
             events_synthesized = len(res_result.resolved_events)
             res_summary = {
                 "total_observations": res_result.total_observations,

@@ -19,9 +19,10 @@ from beacon.resolution.models import (
     ResolutionResult,
 )
 from beacon.resolution.policy import MatchPolicy
-from beacon.resolution.resolver import EventResolver
+from beacon.resolution.resolver import AmbiguousObservationAssociationError, EventResolver
 
 __all__ = [
+    "AmbiguousObservationAssociationError",
     "CandidateGenerator",
     "CandidateMatch",
     "DecisionType",

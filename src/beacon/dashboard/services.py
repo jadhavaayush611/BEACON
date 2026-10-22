@@ -224,8 +224,11 @@ class DashboardService:
     ) -> ETLPipelineResult:
         """Execute ETL and resolution on the given file paths."""
         effective_factory = self.session_factory if persist_db else None
+        effective_settings = self.settings
+        if not persist_db and self.settings.database_url:
+            effective_settings = self.settings.model_copy(update=dict(database_url=None))
         runner = ETLRunner(
-            settings=self.settings,
+            settings=effective_settings,
             session_factory=effective_factory,
             repository=self.repository,
         )
@@ -243,9 +246,15 @@ class DashboardService:
             self._in_memory_observations = list(obs_map.values())
 
             if enable_resolution and result.quality_report.accepted_records:
+                in_memory_obs_by_event: dict[str, list[DisasterObservation]] = {}
+                for ev in self._in_memory_events:
+                    in_memory_obs_by_event[ev.event_id] = [
+                        o for o in self._in_memory_observations if o.observation_id in ev.observation_ids
+                    ]
                 res_out = runner.resolver.resolve_observations(
                     result.quality_report.accepted_records,
                     existing_events=self._in_memory_events,
+                    existing_event_observations=in_memory_obs_by_event,
                 )
                 self._in_memory_events = res_out.resolved_events
 
@@ -318,7 +327,7 @@ class DashboardService:
                             severity=o.severity,
                             latitude=o.latitude,
                             longitude=o.longitude,
-                            extraction_confidence=o.extraction_confidence or 0.0,
+                            extraction_confidence=o.extraction_confidence,
                             page_number=o.page_number,
                             source_reference=o.source_reference,
                             raw_claim=o.raw_claim,

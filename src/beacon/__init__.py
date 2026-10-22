@@ -23,6 +23,7 @@ from beacon.analytics import AnalyticsFilter, AnalyticsService, AnalyticsSummary
 from beacon.pipeline import ETLPipelineResult, ETLRunner, ObservationTransformer
 from beacon.quality import DataQualityValidator, QualityReport, RuleSeverity, ValidationOutcome
 from beacon.resolution import (
+    AmbiguousObservationAssociationError,
     CandidateGenerator,
     CandidateMatch,
     DecisionType,
@@ -70,6 +71,7 @@ __all__ = [
     "generate_source_id",
     "generate_observation_id",
     "generate_event_id",
+    "AmbiguousObservationAssociationError",
     "EventResolver",
     "ObservationMatcher",
     "CandidateGenerator",
