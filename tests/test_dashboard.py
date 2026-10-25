@@ -13,8 +13,11 @@ from sqlalchemy.orm import sessionmaker
 from beacon.analytics.models import AnalyticsFilter
 from beacon.config import Settings
 from beacon.dashboard.formatters import (
+    explain_compression_ratio,
     format_compression_ratio,
     format_confidence,
+    format_conflict_claim_markdown,
+    format_conflict_claim_row,
     format_coordinates,
     format_decision_row,
     format_observation_row,
@@ -31,6 +34,26 @@ from beacon.models import (
     UnifiedDisasterEvent,
 )
 from beacon.storage import StorageRepository, drop_db, init_db
+
+
+def _can_create_socketpair() -> bool:
+    """Return True if local loopback socket connections can be established."""
+    import socket
+    try:
+        s1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s1.bind(("127.0.0.1", 0))
+        port = s1.getsockname()[1]
+        s1.listen(1)
+        s2 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s2.settimeout(0.5)
+        s2.connect(("127.0.0.1", port))
+        conn, _ = s1.accept()
+        conn.close()
+        s1.close()
+        s2.close()
+        return True
+    except Exception:
+        return False
 
 
 @pytest.fixture
@@ -349,6 +372,8 @@ class TestDashboardService:
 
     def test_app_headless_smoke_runs_without_exception(self) -> None:
         """Verify the Streamlit dashboard application launches and runs headlessly without error."""
+        if not _can_create_socketpair():
+            pytest.skip("Local loopback socket connection forbidden in sandboxed environment")
         from streamlit.testing.v1 import AppTest
 
         app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
@@ -391,6 +416,8 @@ class TestDashboardService:
 
     def test_app_headless_runs_complete_pipeline_without_exception(self) -> None:
         """Verify dashboard runs complete sample pipeline and renders all views safely."""
+        if not _can_create_socketpair():
+            pytest.skip("Local loopback socket connection forbidden in sandboxed environment")
         from streamlit.testing.v1 import AppTest
 
         app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
@@ -418,6 +445,243 @@ class TestDashboardService:
                         found_numeric_confidence = True
         assert found_na_confidence, "Expected at least one observation with 'N/A' confidence"
         assert found_numeric_confidence, "Expected at least one observation with formatted numeric confidence"
+
+        # Verify session state and success banner output
+        assert at.session_state.get("last_pipeline_result") is not None
+        exec_id = at.session_state["last_pipeline_result"].execution_id
+        success_banners = [s.value for s in at.success if "Complete!" in s.value]
+        assert len(success_banners) == 1
+        assert exec_id in success_banners[0]
+
+        # Verify compression-ratio explanation and formula captions rendered
+        comp_caps = [c.value for c in at.caption if "Compression Ratio" in c.value]
+        assert len(comp_caps) > 0
+        comp_infos = [i.value for i in at.info if "Compression Ratio" in i.value]
+        assert len(comp_infos) > 0
+
+        # Verify conflict-claim detail text rendered
+        claim_lines = [m.value for m in at.markdown if "status:" in m.value]
+        assert len(claim_lines) > 0
+
+        # Verify rerun stability: rerunning script without button click does NOT trigger a second pipeline run
+        at.run()
+        assert not at.exception
+        assert at.session_state["last_pipeline_result"].execution_id == exec_id
+
+    def test_app_headless_failed_run_clears_prior_success_results(self) -> None:
+        """A failed pipeline execution clears prior success results so stale metrics are never displayed."""
+        if not _can_create_socketpair():
+            pytest.skip("Local loopback socket connection forbidden in sandboxed environment")
+        from streamlit.testing.v1 import AppTest
+
+        app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
+        at = AppTest.from_file(str(app_path), default_timeout=30)
+        at.run()
+
+        run_btns = [b for b in at.button if "Run Complete Pipeline" in b.label]
+        assert len(run_btns) == 1
+
+        # Run 1: initial successful execution
+        run_btns[0].click().run()
+        assert at.session_state.get("last_pipeline_result") is not None
+        assert len([s.value for s in at.success if "Complete!" in s.value]) == 1
+
+        # Run 2: simulated failed execution
+        def fail_pipeline(*args, **kwargs):
+            raise RuntimeError("Simulated ETL extraction failure")
+
+        orig = DashboardService.run_pipeline_on_paths
+        DashboardService.run_pipeline_on_paths = fail_pipeline
+        try:
+            run_btns[0].click().run()
+        finally:
+            DashboardService.run_pipeline_on_paths = orig
+
+        # Assert prior success results were cleared
+        assert at.session_state.get("last_pipeline_result") is None
+        assert at.session_state.get("last_pipeline_error") == "Simulated ETL extraction failure"
+        assert len([s.value for s in at.success if "Complete!" in s.value]) == 0
+        assert any("Simulated ETL extraction failure" in e.value for e in at.error)
+
+
+    def test_overview_refreshes_immediately_after_pipeline_execution(self) -> None:
+        """Overview metrics update immediately upon pipeline execution from zero to resolved counts."""
+        service = DashboardService(settings=Settings(database_url=None), session_factory=None)
+        sample_paths = [
+            Path("data/sample/events.json"),
+            Path("data/sample/events.csv"),
+            Path("data/sample/events.txt"),
+            Path("data/sample/sample_report.pdf"),
+            Path("data/sample/sample_disaster.png"),
+        ]
+        if not all(p.exists() for p in sample_paths):
+            pytest.skip("Standard sample files not available")
+
+        # Initial state before execution: empty overview
+        initial_overview = service.get_system_overview()
+        assert initial_overview["events_count"] == 0
+        assert initial_overview["observations_count"] == 0
+        assert initial_overview["compression_ratio"] == 0.0
+
+        # Run pipeline
+        res = service.run_pipeline_on_paths(sample_paths, enable_resolution=True, persist_db=False)
+        assert res.observations_accepted == 10
+        assert res.events_synthesized == 7
+
+        # Post-run overview must immediately reflect 7 events, 10 observations, and ~1.43x ratio
+        post_overview = service.get_system_overview()
+        assert post_overview["events_count"] == 7
+        assert post_overview["observations_count"] == 10
+        assert post_overview["compression_ratio"] == 1.43
+        assert post_overview["sources_count"] == 4
+
+    def test_sample_observation_files_separated_from_manifest(self) -> None:
+        """Sample data directory separates 5 input observation files from the manifest specification."""
+        sample_dir = Path("data/sample")
+        if not sample_dir.exists():
+            pytest.skip("Sample data directory not found")
+
+        observation_files = [
+            s for s in sorted(sample_dir.glob("*.*")) if s.name.lower() != "manifest.json"
+        ]
+        manifest_file = sample_dir / "manifest.json"
+
+        # Assert exactly 5 observation input files are present
+        assert len(observation_files) == 5
+        obs_names = {f.name for f in observation_files}
+        expected_names = {
+            "events.json",
+            "events.csv",
+            "events.txt",
+            "sample_report.pdf",
+            "sample_disaster.png",
+        }
+        assert obs_names == expected_names
+
+        # Assert manifest exists separately as specification metadata
+        assert manifest_file.exists()
+        import json
+        manifest = json.loads(manifest_file.read_text(encoding="utf-8"))
+        assert "manifest_version" in manifest
+        assert "samples" in manifest
+        assert len(manifest["samples"]) == 5
+
+    def test_conflicting_claims_table_structure_and_resolution_notes(self) -> None:
+        """Conflicting claims display structure preserves all 6 audit fields and full resolution notes."""
+        from beacon.models import ConflictingClaim
+
+        claim = ConflictingClaim(
+            field_name="severity",
+            claimed_value="moderate",
+            observation_id="obs_test_01",
+            source_id="src_csv_01",
+            resolution_status="superseded",
+            notes="Resolved to 'severe' based on highest reported severity/plurality consensus across contributing feeds.",
+        )
+        row = format_conflict_claim_row(claim)
+        # Check all 6 audit fields are preserved
+        assert set(row.keys()) == {
+            "Field",
+            "Claimed Value",
+            "Observation ID",
+            "Source ID",
+            "Status",
+            "Resolution Notes",
+        }
+        # Full notes are unabbreviated and intact
+        assert "highest reported severity/plurality" in row["Resolution Notes"]
+
+        # Markdown bullet rendering preserves notes
+        md_bullet = format_conflict_claim_markdown(claim)
+        assert "Severity" in md_bullet
+        assert "moderate" in md_bullet
+        assert "src_csv_01" in md_bullet
+        assert "highest reported severity/plurality" in md_bullet
+
+    def test_conflicting_claims_missing_notes_fallback(self) -> None:
+        """Missing or empty resolution notes fall back to clear message without literal None."""
+        from beacon.models import ConflictingClaim
+
+        # Case 1: notes is None
+        c_none = ConflictingClaim(
+            field_name="severity",
+            claimed_value="moderate",
+            observation_id="obs_none",
+            source_id="src_1",
+            resolution_status="superseded",
+            notes=None,
+        )
+        row_none = format_conflict_claim_row(c_none)
+        assert row_none["Resolution Notes"] == "No resolution notes recorded."
+        assert "None" not in row_none["Resolution Notes"]
+        md_none = format_conflict_claim_markdown(c_none)
+        assert "No resolution notes recorded." in md_none
+        assert "None" not in md_none
+
+        # Case 2: notes is empty string
+        c_empty = ConflictingClaim(
+            field_name="location",
+            claimed_value="Delta",
+            observation_id="obs_empty",
+            source_id="src_2",
+            resolution_status="superseded",
+            notes="",
+        )
+        row_empty = format_conflict_claim_row(c_empty)
+        assert row_empty["Resolution Notes"] == "No resolution notes recorded."
+        md_empty = format_conflict_claim_markdown(c_empty)
+        assert "No resolution notes recorded." in md_empty
+
+        # Case 3: notes is whitespace only
+        c_space = ConflictingClaim(
+            field_name="event_type",
+            claimed_value="storm",
+            observation_id="obs_space",
+            source_id="src_3",
+            resolution_status="superseded",
+            notes="   ",
+        )
+        row_space = format_conflict_claim_row(c_space)
+        assert row_space["Resolution Notes"] == "No resolution notes recorded."
+        md_space = format_conflict_claim_markdown(c_space)
+        assert "No resolution notes recorded." in md_space
+
+    def test_analytics_horizontal_bar_chart_dataframes(self) -> None:
+        """Analytics distribution data structures accurately convert to DataFrames without mutating values."""
+        import pandas as pd
+        service = DashboardService(settings=Settings(database_url=None), session_factory=None)
+        sample_path = Path("data/sample/events.json")
+        if not sample_path.exists():
+            pytest.skip("Sample data file not found")
+
+        service.run_pipeline_on_paths([sample_path], enable_resolution=True, persist_db=False)
+        summary = service.get_analytics_summary()
+
+        # 1. Disaster Types DataFrame
+        df_types = pd.DataFrame(
+            list(summary.events_by_type.items()),
+            columns=["Disaster Type", "Event Count"],
+        )
+        assert "Disaster Type" in df_types.columns
+        assert "Event Count" in df_types.columns
+        assert df_types["Event Count"].sum() == summary.total_events
+
+        # 2. Severity DataFrame
+        df_sev = pd.DataFrame(
+            list(summary.events_by_severity.items()),
+            columns=["Severity Level", "Event Count"],
+        )
+        assert "Severity Level" in df_sev.columns
+        assert "Event Count" in df_sev.columns
+        assert df_sev["Event Count"].sum() == summary.total_events
+
+        # 3. Conflicting Claims DataFrame
+        df_conf = pd.DataFrame(
+            list(summary.conflicting_claims_by_field.items()),
+            columns=["Field Name", "Conflicting Claims"],
+        )
+        assert "Field Name" in df_conf.columns
+        assert "Conflicting Claims" in df_conf.columns
 
 
 class TestDashboardFormatters:
@@ -462,6 +726,22 @@ class TestDashboardFormatters:
         assert format_compression_ratio(1.428) == "1.43x"
         assert format_compression_ratio(0.0) == "0.00x"
         assert format_compression_ratio(None) == "N/A"
+
+    def test_explain_compression_ratio(self) -> None:
+        """explain_compression_ratio formats ratio with derivation and handles zero events safely."""
+        # Non-zero events
+        msg = explain_compression_ratio(10, 7, 10 / 7)
+        assert "1.43x" in msg
+        assert "10 observations ÷ 7 unified events" in msg
+
+        # Zero events safe handling
+        zero_msg = explain_compression_ratio(0, 0, 0.0)
+        assert "0.00x" in zero_msg
+        assert "0 events loaded" in zero_msg
+
+        # None ratio safe handling
+        none_msg = explain_compression_ratio(0, 0, None)
+        assert "N/A" in none_msg
 
     def test_format_observation_row_fully_populated(self) -> None:
         """Fully populated observation produces complete formatted dictionary."""

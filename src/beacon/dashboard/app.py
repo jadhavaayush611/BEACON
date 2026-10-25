@@ -3,13 +3,18 @@
 "One event, many sources, one trusted data profile."
 """
 
+import json
 from pathlib import Path
+import pandas as pd
 import streamlit as st
 
 from beacon.analytics.models import AnalyticsFilter
 from beacon.config import get_settings
 from beacon.dashboard.formatters import (
+    explain_compression_ratio,
     format_compression_ratio,
+    format_conflict_claim_markdown,
+    format_conflict_claim_row,
     format_decision_row,
     format_observation_row,
 )
@@ -75,7 +80,13 @@ tab_overview, tab_ingest, tab_pipeline, tab_events, tab_analytics, tab_diagnosti
 # TAB 1: OVERVIEW
 # ==============================================================================
 with tab_overview:
-    st.header("Executive Pipeline Overview")
+    col_hdr1, col_hdr2 = st.columns([4, 1])
+    with col_hdr1:
+        st.header("Executive Pipeline Overview")
+    with col_hdr2:
+        if st.button("🔄 Refresh Overview"):
+            st.rerun()
+
     overview = service.get_system_overview()
 
     c1, c2, c3, c4 = st.columns(4)
@@ -101,8 +112,18 @@ with tab_overview:
         st.metric(
             label="Compression Ratio",
             value=format_compression_ratio(overview.get("compression_ratio")),
-            help="Ratio of raw observations consolidated per unified event",
+            help=(
+                "Consolidation Metric: Total Accepted Observations ÷ Total Unified Events (average observations per unified event).\n\n"
+                "Descriptive ratio indicating the degree of data consolidation (e.g., 10 observations consolidated into 7 events = 1.43x). "
+                "If total events is 0, the ratio evaluates safely to 0.00x without fabricating synthetic values."
+            ),
         )
+
+    st.caption(
+        f"ℹ️ **Compression Ratio:** "
+        f"{explain_compression_ratio(overview['observations_count'], overview['events_count'], overview.get('compression_ratio'))}. "
+        "Descriptive consolidation metric (observations per unified event): $\\text{Compression Ratio} = \\frac{\\text{Total Observations}}{\\text{Total Events}}$."
+    )
 
     st.markdown("---")
 
@@ -201,16 +222,38 @@ with tab_ingest:
                     st.write("No observations extracted from uploaded files.")
 
     st.markdown("---")
-    st.subheader("Default Sample Data Files")
+    st.subheader("Default Sample Observation Files (Pipeline Inputs)")
     sample_dir = Path("data/sample")
     if sample_dir.exists():
-        samples = list(sample_dir.glob("*.*"))
-        st.write(f"Found **{len(samples)}** pre-bundled sample disaster records in `{sample_dir}`:")
+        # Separate the 5 observation data files from the metadata manifest
+        observation_samples = [
+            s for s in sorted(sample_dir.glob("*.*")) if s.name.lower() != "manifest.json"
+        ]
+        manifest_path = sample_dir / "manifest.json"
+
+        st.write(
+            f"Found **{len(observation_samples)}** standard disaster observation input files in `{sample_dir}` "
+            f"used as target dataset for pipeline execution:"
+        )
         sample_rows = [
             {"File": s.name, "Format": s.suffix.upper(), "Size (bytes)": s.stat().st_size}
-            for s in samples
+            for s in observation_samples
         ]
         st.dataframe(sample_rows, width="stretch")
+
+        if manifest_path.exists():
+            st.markdown("#### 📋 Dataset Specification & Manifest Metadata")
+            st.caption(
+                f"`{manifest_path.name}` ({manifest_path.stat().st_size} bytes) is the dataset manifest and specification. "
+                "It defines the schema version, ground-truth co-references, and synthetic data disclaimer for the 5 sample inputs. "
+                "It serves as test metadata and is not ingested as an observation feed."
+            )
+            with st.expander("View Sample Dataset Manifest Specification"):
+                try:
+                    manifest_content = json.loads(manifest_path.read_text(encoding="utf-8"))
+                    st.json(manifest_content)
+                except Exception as m_err:
+                    st.warning(f"Could not read manifest metadata: {m_err}")
 
 # ==============================================================================
 # TAB 3: PIPELINE EXECUTION
@@ -244,30 +287,48 @@ with tab_pipeline:
         run_btn = st.button("🚀 Run Complete Pipeline", type="primary")
 
     if run_btn:
-        with st.spinner("Executing BEACON ETL and Resolution Pipeline..."):
-            result = service.run_pipeline_on_paths(
-                existing_samples,
-                enable_resolution=resolution_option,
-                persist_db=persist_option,
-            )
+        # Clear prior execution result and errors to prevent stale metrics on failure
+        st.session_state["last_pipeline_result"] = None
+        st.session_state["last_pipeline_error"] = None
 
-        st.success(f"Pipeline Run `{result.execution_id}` Complete!")
+        with st.spinner("Executing BEACON ETL and Resolution Pipeline..."):
+            try:
+                result = service.run_pipeline_on_paths(
+                    existing_samples,
+                    enable_resolution=resolution_option,
+                    persist_db=persist_option,
+                )
+                st.session_state["last_pipeline_result"] = result
+                st.rerun()
+            except Exception as ex:
+                st.session_state["last_pipeline_error"] = str(ex)
+                st.rerun()
+
+    # Display error from latest run if execution failed
+    last_error = st.session_state.get("last_pipeline_error")
+    if last_error:
+        st.error(f"Pipeline execution failed: {last_error}")
+
+    # Display success results ONLY if the latest run succeeded
+    last_result = st.session_state.get("last_pipeline_result")
+    if last_result is not None:
+        st.success(f"Pipeline Run `{last_result.execution_id}` Complete!")
 
         # Results metrics
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Files Ingested", f"{result.files_succeeded}/{result.files_discovered}")
-        m2.metric("Raw Extracted", result.observations_extracted)
-        m3.metric("Quality Accepted", result.observations_accepted)
-        m4.metric("Quality Rejected", result.observations_rejected)
-        m5.metric("Events Synthesized", result.events_synthesized)
+        m1.metric("Files Ingested", f"{last_result.files_succeeded}/{last_result.files_discovered}")
+        m2.metric("Raw Extracted", last_result.observations_extracted)
+        m3.metric("Quality Accepted", last_result.observations_accepted)
+        m4.metric("Quality Rejected", last_result.observations_rejected)
+        m5.metric("Events Synthesized", last_result.events_synthesized)
 
-        if result.errors:
-            st.error(f"Encountered {len(result.errors)} pipeline error(s):")
-            for err in result.errors:
+        if last_result.errors:
+            st.error(f"Encountered {len(last_result.errors)} pipeline error(s):")
+            for err in last_result.errors:
                 st.write(f"- {err}")
 
         with st.expander("Data Quality Validation Findings"):
-            qr = result.quality_report
+            qr = last_result.quality_report
             st.write(f"Summary: **{qr.passed_count}** passed, **{qr.failed_count}** failed checks.")
             findings_data = [
                 {
@@ -345,18 +406,24 @@ with tab_events:
                 # Conflicting claims audit
                 if ev.conflicting_claims:
                     st.markdown("##### ⚠️ Conflicting Claims Preserved Across Sources")
-                    c_rows = [
-                        {
-                            "Field": c.field_name,
-                            "Claimed Value": c.claimed_value,
-                            "Observation ID": c.observation_id,
-                            "Source ID": c.source_id,
-                            "Status": c.resolution_status,
-                            "Resolution Notes": c.notes,
-                        }
-                        for c in ev.conflicting_claims
-                    ]
-                    st.dataframe(c_rows, width="stretch")
+                    c_rows = [format_conflict_claim_row(c) for c in ev.conflicting_claims]
+                    claims_column_config = {
+                        "Field": st.column_config.TextColumn("Field", width="small"),
+                        "Claimed Value": st.column_config.TextColumn("Claimed Value", width="small"),
+                        "Observation ID": st.column_config.TextColumn("Observation ID", width="medium"),
+                        "Source ID": st.column_config.TextColumn("Source ID", width="medium"),
+                        "Status": st.column_config.TextColumn("Status", width="small"),
+                        "Resolution Notes": st.column_config.TextColumn(
+                            "Resolution Notes",
+                            width="large",
+                            help="Complete explainable consensus resolution rationale.",
+                        ),
+                    }
+                    st.dataframe(c_rows, column_config=claims_column_config, width="stretch")
+
+                    with st.expander("🔍 Complete Resolution Notes & Claim Audit Details", expanded=True):
+                        for claim in ev.conflicting_claims:
+                            st.markdown(format_conflict_claim_markdown(claim))
 
                 # Fetch full event detail
                 detail = service.get_event_detail(ev.event_id)
@@ -382,9 +449,23 @@ with tab_analytics:
     summary = service.get_analytics_summary()
 
     a1, a2, a3 = st.columns(3)
-    a1.metric("Total Events", summary.total_events)
-    a2.metric("Total Observations", summary.total_observations)
-    a3.metric("Compression Ratio", format_compression_ratio(summary.compression_ratio))
+    a1.metric("Total Events", summary.total_events, help="Total canonical disaster profiles synthesized")
+    a2.metric("Total Observations", summary.total_observations, help="Total observations extracted across all input sources")
+    a3.metric(
+        "Compression Ratio",
+        format_compression_ratio(summary.compression_ratio),
+        help=(
+            "Consolidation Metric: Total Observations ÷ Total Events (average observations per unified event).\n\n"
+            "Descriptive ratio indicating consolidation degree (e.g., 10 observations consolidated into 7 events = 1.43x). "
+            "Evaluates safely to 0.00x when total events is zero."
+        ),
+    )
+
+    st.info(
+        f"💡 **Compression Ratio:** "
+        f"{explain_compression_ratio(summary.total_observations, summary.total_events, summary.compression_ratio)}. "
+        "Descriptive consolidation metric representing the average number of constituent observations per unified disaster event."
+    )
 
     st.markdown("---")
     d1, d2 = st.columns(2)
@@ -392,20 +473,53 @@ with tab_analytics:
     with d1:
         st.subheader("Events by Disaster Type")
         if summary.events_by_type:
-            st.bar_chart(summary.events_by_type)
+            df_types = pd.DataFrame(
+                list(summary.events_by_type.items()),
+                columns=["Disaster Type", "Event Count"],
+            )
+            st.bar_chart(
+                df_types,
+                x="Disaster Type",
+                y="Event Count",
+                horizontal=True,
+                x_label="Event Count",
+                y_label="Disaster Type",
+            )
         else:
             st.write("No event type distribution data available.")
 
     with d2:
         st.subheader("Events by Severity Rank")
         if summary.events_by_severity:
-            st.bar_chart(summary.events_by_severity)
+            df_sev = pd.DataFrame(
+                list(summary.events_by_severity.items()),
+                columns=["Severity Level", "Event Count"],
+            )
+            st.bar_chart(
+                df_sev,
+                x="Severity Level",
+                y="Event Count",
+                horizontal=True,
+                x_label="Event Count",
+                y_label="Severity Level",
+            )
         else:
             st.write("No severity distribution data available.")
 
     st.subheader("Field Conflict Frequency")
     if summary.conflicting_claims_by_field:
-        st.bar_chart(summary.conflicting_claims_by_field)
+        df_conf = pd.DataFrame(
+            list(summary.conflicting_claims_by_field.items()),
+            columns=["Field Name", "Conflicting Claims"],
+        )
+        st.bar_chart(
+            df_conf,
+            x="Field Name",
+            y="Conflicting Claims",
+            horizontal=True,
+            x_label="Conflicting Claims",
+            y_label="Field Name",
+        )
     else:
         st.write("No attribute conflict frequency recorded.")
 
