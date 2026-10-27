@@ -1,6 +1,7 @@
 """Unit tests for BEACON ETL pipeline orchestrator (Extract, Transform, Validate, Load, Report)."""
 
 from pathlib import Path
+from unittest.mock import patch
 import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
@@ -8,8 +9,10 @@ from sqlalchemy.orm import sessionmaker
 from beacon.config import Settings
 from beacon.pipeline import ETLPipelineResult, ETLRunner
 from beacon.storage import (
+    EventModel,
     ObservationModel,
     QualityResultModel,
+    ResolutionDecisionModel,
     SourceModel,
     drop_db,
     get_session_factory,
@@ -171,3 +174,71 @@ class TestETLPipelineUnit:
         assert "observations_accepted" in data
         assert "quality_report" in data
         assert isinstance(data["quality_report"], dict)
+
+    def test_pipeline_atomic_rollback_on_persistence_failure(
+        self, in_memory_db: sessionmaker, sample_files: list[Path]
+    ) -> None:
+        """When an exception occurs during resolution persistence, entire batch rolls back atomically."""
+        runner = ETLRunner(session_factory=in_memory_db)
+
+        # Mock repository.save_resolution_result to raise a database exception
+        with patch.object(
+            runner.repository, "save_resolution_result", side_effect=RuntimeError("Simulated DB Disk Crash")
+        ):
+            result = runner.run([sample_files[0]], enable_resolution=True)
+
+        assert result.records_persisted == 0
+        assert any("Database persistence failed during ETL transaction" in err for err in result.errors)
+
+        # Verify database is completely empty: rollback cleaned up sources, observations, events
+        with in_memory_db() as session:
+            sources = session.execute(select(SourceModel)).scalars().all()
+            observations = session.execute(select(ObservationModel)).scalars().all()
+            events = session.execute(select(EventModel)).scalars().all()
+            decisions = session.execute(select(ResolutionDecisionModel)).scalars().all()
+
+            assert len(sources) == 0
+            assert len(observations) == 0
+            assert len(events) == 0
+            assert len(decisions) == 0
+
+    def test_pipeline_atomic_rollback_on_resolution_failure(
+        self, in_memory_db: sessionmaker, sample_files: list[Path]
+    ) -> None:
+        """When an unhandled exception occurs during event resolution, entire batch rolls back atomically."""
+        runner = ETLRunner(session_factory=in_memory_db)
+
+        with patch.object(
+            runner.resolver, "resolve_observations", side_effect=RuntimeError("Resolution algorithm error")
+        ):
+            result = runner.run([sample_files[0]], enable_resolution=True)
+
+        assert result.records_persisted == 0
+        assert any("Database persistence failed during ETL transaction" in err for err in result.errors)
+
+        with in_memory_db() as session:
+            assert len(session.execute(select(SourceModel)).scalars().all()) == 0
+            assert len(session.execute(select(ObservationModel)).scalars().all()) == 0
+            assert len(session.execute(select(EventModel)).scalars().all()) == 0
+
+    def test_pipeline_atomic_persistence_success(
+        self, in_memory_db: sessionmaker, sample_files: list[Path]
+    ) -> None:
+        """All entities persist atomically within the single transaction boundary."""
+        runner = ETLRunner(session_factory=in_memory_db)
+        result = runner.run([sample_files[0]], enable_resolution=True)
+
+        assert result.files_succeeded == 1
+        assert result.records_persisted > 0
+        assert len(result.errors) == 0
+
+        with in_memory_db() as session:
+            sources = session.execute(select(SourceModel)).scalars().all()
+            observations = session.execute(select(ObservationModel)).scalars().all()
+            events = session.execute(select(EventModel)).scalars().all()
+            decisions = session.execute(select(ResolutionDecisionModel)).scalars().all()
+
+            assert len(sources) == 1
+            assert len(observations) == result.observations_accepted
+            assert len(events) > 0
+            assert len(decisions) == len(observations)

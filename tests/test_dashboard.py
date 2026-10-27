@@ -13,6 +13,11 @@ from sqlalchemy.orm import sessionmaker
 
 from beacon.analytics.models import AnalyticsFilter
 from beacon.config import Settings, get_settings
+from beacon.dashboard.components import (
+    extract_geographic_dataframe,
+    get_corroboration_badge_html,
+    get_severity_badge_html,
+)
 from beacon.dashboard.formatters import (
     explain_compression_ratio,
     format_compression_ratio,
@@ -1017,3 +1022,169 @@ class TestDashboardFormatters:
         assert row_empty["Decision"] == "N/A"
         assert row_empty["Score"] == "N/A"
         assert row_empty["Rationale"] == "N/A"
+
+    def test_dashboard_service_unassigned_observations_in_memory(self) -> None:
+        """DashboardService returns unassigned observations in in-memory mode."""
+        from beacon.resolution.models import DecisionType, ResolutionOutcome
+
+        service = DashboardService(settings=Settings(database_url=None), session_factory=None)
+        obs1 = DisasterObservation(
+            observation_id="obs_unassigned_1",
+            source_id="src_1",
+            event_type="flood",
+            location="Zone A",
+        )
+        service._in_memory_observations = [obs1]
+        service._in_memory_resolution_outcomes = [
+            ResolutionOutcome(
+                observation_id="obs_unassigned_1",
+                assigned_event_id=None,
+                decision=DecisionType.AMBIGUOUS_CANDIDATE,
+                score=0.42,
+                is_new_event=False,
+                rationale="Score below confident match threshold.",
+            )
+        ]
+        unassigned = service.get_unassigned_observations()
+        assert len(unassigned) == 1
+        assert unassigned[0]["observation"].observation_id == "obs_unassigned_1"
+        assert unassigned[0]["decision"]["decision_type"] == "ambiguous_candidate"
+        assert unassigned[0]["decision"]["composite_score"] == 0.42
+        assert "below confident match" in unassigned[0]["decision"]["rationale"]
+
+    def test_dashboard_service_unassigned_observations_db(self) -> None:
+        """DashboardService queries unassigned observations from DB repository."""
+        from beacon.resolution.models import DecisionType, ResolutionOutcome, ResolutionResult
+        from beacon.storage.schema import Base
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        repo = StorageRepository()
+        factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+        with factory() as session:
+            src = SourceRecord(
+                source_id="src_db_unassigned",
+                source_file="sample.json",
+                source_type=SourceType.JSON,
+                extraction_method=ExtractionMethod.JSON_PARSE,
+                content_hash="c" * 64,
+                extraction_status=ExtractionStatus.SUCCESS,
+                ingested_at=datetime.now(timezone.utc),
+            )
+            repo.save_source(src, session)
+            obs = DisasterObservation(
+                observation_id="obs_db_unassigned",
+                source_id=src.source_id,
+                event_type="earthquake",
+                location="Seismic Point",
+            )
+            repo.save_observations([obs], session)
+            d = ResolutionOutcome(
+                observation_id=obs.observation_id,
+                assigned_event_id=None,
+                decision=DecisionType.AMBIGUOUS_CANDIDATE,
+                score=0.49,
+                is_new_event=False,
+                rationale="Borderline confidence match.",
+            )
+            repo.save_resolution_result(
+                ResolutionResult(resolved_events=[], outcomes=[d], merge_candidates=[]),
+                session,
+            )
+            session.commit()
+
+        service = DashboardService(session_factory=factory, repository=repo)
+        unassigned = service.get_unassigned_observations()
+        assert len(unassigned) == 1
+        assert unassigned[0]["observation"].observation_id == "obs_db_unassigned"
+        assert unassigned[0]["decision"]["decision_type"] == "ambiguous_candidate"
+        assert unassigned[0]["observation"].event_type == "earthquake"
+
+
+class TestDashboardDesignSystem:
+    """Unit tests for Phase 2D design system components, badges, and map data extraction."""
+
+    def test_extract_geographic_dataframe_empty(self) -> None:
+        """Empty event list produces an empty DataFrame with complete coordinate schema."""
+        df = extract_geographic_dataframe([])
+        assert df.empty
+        assert "latitude" in df.columns
+        assert "longitude" in df.columns
+        assert "event_id" in df.columns
+        assert "event_type" in df.columns
+
+    def test_extract_geographic_dataframe_populated(self) -> None:
+        """Events with coordinate centroids produce correctly populated geographic DataFrame."""
+        now = datetime.now(timezone.utc)
+        ev1 = UnifiedDisasterEvent(
+            event_id="evt_geo_1",
+            event_type="flood",
+            location="North District",
+            summary="Flood event",
+            start_time=now,
+            observation_ids=["obs_1"],
+            source_ids=["src_1", "src_2"],
+            metadata={"centroid": {"latitude": 34.05, "longitude": -118.25}},
+            created_at=now,
+            updated_at=now,
+        )
+        ev2 = UnifiedDisasterEvent(
+            event_id="evt_geo_2",
+            event_type="wildfire",
+            location="Ridge Point",
+            summary="Wildfire event",
+            start_time=now,
+            observation_ids=["obs_2"],
+            source_ids=["src_1"],
+            metadata={"unanchored": True},  # Missing centroid
+            created_at=now,
+            updated_at=now,
+        )
+
+        df = extract_geographic_dataframe([ev1, ev2])
+        assert len(df) == 1
+        assert df.iloc[0]["event_id"] == "evt_geo_1"
+        assert df.iloc[0]["latitude"] == 34.05
+        assert df.iloc[0]["longitude"] == -118.25
+        assert df.iloc[0]["sources_count"] == 2
+
+    def test_get_severity_badge_html(self) -> None:
+        """Severity levels map to appropriate CSS badge classes."""
+        assert "badge-critical" in get_severity_badge_html("critical")
+        assert "badge-severe" in get_severity_badge_html("severe")
+        assert "badge-moderate" in get_severity_badge_html("moderate")
+        assert "badge-minor" in get_severity_badge_html("minor")
+        assert "badge-unspecified" in get_severity_badge_html(None)
+
+    def test_get_corroboration_badge_html(self) -> None:
+        """Corroboration status distinguishes multi-source from single-source."""
+        multi_badge = get_corroboration_badge_html(3)
+        assert "badge-multi-source" in multi_badge
+        assert "MULTI-SOURCE (3)" in multi_badge
+
+        single_badge = get_corroboration_badge_html(1)
+        assert "badge-single-source" in single_badge
+        assert "SINGLE-SOURCE" in single_badge
+
+    def test_app_headless_renders_geospatial_and_corroboration_features(
+        self, isolate_in_memory_dashboard: None
+    ) -> None:
+        """Headless AppTest verifies geospatial feed, map component, and corroboration filters."""
+        if not _can_create_socketpair():
+            pytest.skip("Local loopback socket connection forbidden in sandboxed environment")
+        from streamlit.testing.v1 import AppTest
+
+        app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
+        at = AppTest.from_file(str(app_path), default_timeout=30)
+        at.run()
+
+        # Run complete pipeline
+        run_btns = [b for b in at.button if "Run Complete Pipeline" in b.label]
+        assert len(run_btns) == 1
+        run_btns[0].click().run()
+
+        assert not at.exception
+        # Verify feed dataframes are rendered without error
+        dfs = at.dataframe
+        assert len(dfs) >= 2

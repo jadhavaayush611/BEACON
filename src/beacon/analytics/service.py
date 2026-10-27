@@ -68,18 +68,46 @@ class AnalyticsService:
         filtered_events = self.filter_events(events, filter_criteria)
         total_events = len(filtered_events)
 
-        # Observations mapping
-        if observations:
-            total_obs = len(observations)
-            obs_missing_coords = sum(
-                1 for o in observations if o.latitude is None or o.longitude is None
+        is_filtered = filter_criteria is not None and any(
+            getattr(filter_criteria, f) is not None
+            for f in (
+                "event_type",
+                "severity",
+                "location",
+                "min_sources",
+                "start_time_after",
+                "end_time_before",
             )
-            obs_missing_times = sum(1 for o in observations if o.event_time is None)
+        )
+
+        # Observations mapping distinguishing event-filtered from global metrics
+        if is_filtered:
+            linked_obs_ids = {oid for e in filtered_events for oid in e.observation_ids}
+            if observations:
+                matching_obs = [o for o in observations if o.observation_id in linked_obs_ids]
+                total_obs = len(matching_obs)
+                obs_missing_coords = sum(
+                    1 for o in matching_obs if o.latitude is None or o.longitude is None
+                )
+                obs_missing_times = sum(1 for o in matching_obs if o.event_time is None)
+            else:
+                total_obs = len(linked_obs_ids)
+                obs_missing_coords = 0
+                obs_missing_times = 0
+            # Unassigned ambiguous observations are not attributed to filtered events
+            ambiguous_count_effective = 0
         else:
-            # Derived from event constituent IDs if observations not supplied
-            total_obs = sum(len(e.observation_ids) for e in filtered_events)
-            obs_missing_coords = 0
-            obs_missing_times = 0
+            if observations:
+                total_obs = len(observations)
+                obs_missing_coords = sum(
+                    1 for o in observations if o.latitude is None or o.longitude is None
+                )
+                obs_missing_times = sum(1 for o in observations if o.event_time is None)
+            else:
+                total_obs = sum(len(e.observation_ids) for e in filtered_events)
+                obs_missing_coords = 0
+                obs_missing_times = 0
+            ambiguous_count_effective = ambiguous_count
 
         compression_ratio = (
             round(total_obs / total_events, 2) if total_events > 0 else 0.0
@@ -139,7 +167,7 @@ class AnalyticsService:
             conflicting_claims_count=total_conflicts,
             conflicting_claims_by_field=dict(conflict_field_counts),
             coverage_gaps=gaps,
-            ambiguous_observations_count=ambiguous_count,
+            ambiguous_observations_count=ambiguous_count_effective,
             merge_candidates_count=merge_count,
         )
 

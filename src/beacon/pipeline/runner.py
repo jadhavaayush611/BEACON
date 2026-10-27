@@ -10,7 +10,8 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from beacon.config import Settings, get_settings
 from beacon.ingestion import IngestionResult, ingest_file
-from beacon.models import DisasterObservation, UnifiedDisasterEvent
+from beacon.logging_config import setup_logging
+from beacon.models import DisasterObservation
 from beacon.pipeline.result import ETLPipelineResult
 from beacon.pipeline.transform import ObservationTransformer
 from beacon.quality import DataQualityValidator, QualityReport
@@ -32,6 +33,7 @@ class ETLRunner:
         resolver: Optional[Any] = None,
     ) -> None:
         self.settings = settings or get_settings()
+        setup_logging(self.settings)
         self.transformer = transformer or ObservationTransformer()
         self.validator = validator or DataQualityValidator()
         self.repository = repository or StorageRepository()
@@ -144,7 +146,7 @@ class ETLRunner:
         # 3. Validate
         quality_report = self.validate(transformed_observations)
 
-        # 4. Load (if storage session factory is configured)
+        # 4. Load & Resolution
         records_persisted = 0
         events_synthesized = 0
         events_persisted = 0
@@ -154,63 +156,67 @@ class ETLRunner:
         if storage_enabled:
             assert self.session_factory is not None
             try:
+                # Execute all storage operations in a single atomic transaction boundary
                 with get_session(self.session_factory) as session:
                     records_persisted = self.load(
                         file_results=ingestion_results,
                         quality_report=quality_report,
                         session=session,
                     )
-            except Exception as db_err:
-                err_msg = f"Database persistence failed during ETL load: {db_err}"
-                logger.error(err_msg)
-                errors.append(err_msg)
-        else:
-            logger.info("Database storage not configured; skipping persistence step")
 
-        # 5. Optional Event Resolution
-        if enable_resolution and quality_report.accepted_records:
-            logger.info(
-                "Resolving %d accepted observations into unified events",
-                len(quality_report.accepted_records),
-            )
-            existing_events: list[UnifiedDisasterEvent] = []
-            existing_event_obs: dict[str, list[DisasterObservation]] = {}
-            if storage_enabled:
-                assert self.session_factory is not None
-                try:
-                    with get_session(self.session_factory) as session:
+                    if enable_resolution and quality_report.accepted_records:
+                        logger.info(
+                            "Resolving %d accepted observations into unified events",
+                            len(quality_report.accepted_records),
+                        )
                         existing_events, existing_event_obs = (
                             self.repository.get_all_events_with_observations(session)
                         )
-                except Exception as ex_err:
-                    logger.warning("Could not load existing events from storage: %s", ex_err)
-
-            res_result = self.resolver.resolve_observations(
-                quality_report.accepted_records,
-                existing_events=existing_events,
-                existing_event_observations=existing_event_obs,
-            )
-            events_synthesized = len(res_result.resolved_events)
-            res_summary = {
-                "total_observations": res_result.total_observations,
-                "events_created": res_result.events_created,
-                "events_updated": res_result.events_updated,
-                "observations_assigned": res_result.observations_assigned,
-                "ambiguous_count": res_result.ambiguous_count,
-                "merge_candidates_count": len(res_result.merge_candidates),
-                "resolved_events_count": len(res_result.resolved_events),
-            }
-
-            if storage_enabled:
-                assert self.session_factory is not None
-                try:
-                    with get_session(self.session_factory) as session:
+                        res_result = self.resolver.resolve_observations(
+                            quality_report.accepted_records,
+                            existing_events=existing_events,
+                            existing_event_observations=existing_event_obs,
+                        )
+                        events_synthesized = len(res_result.resolved_events)
+                        res_summary = {
+                            "total_observations": res_result.total_observations,
+                            "events_created": res_result.events_created,
+                            "events_updated": res_result.events_updated,
+                            "observations_assigned": res_result.observations_assigned,
+                            "ambiguous_count": res_result.ambiguous_count,
+                            "merge_candidates_count": len(res_result.merge_candidates),
+                            "resolved_events_count": len(res_result.resolved_events),
+                        }
                         res_counts = self.repository.save_resolution_result(res_result, session)
                         events_persisted = res_counts.get("events_persisted", 0)
-                except Exception as res_db_err:
-                    err_msg = f"Database persistence failed during event resolution: {res_db_err}"
-                    logger.error(err_msg)
-                    errors.append(err_msg)
+            except Exception as db_err:
+                err_msg = f"Database persistence failed during ETL transaction: {db_err}"
+                logger.error(err_msg)
+                errors.append(err_msg)
+                records_persisted = 0
+                events_persisted = 0
+        else:
+            logger.info("Database storage not configured; skipping persistence step")
+            if enable_resolution and quality_report.accepted_records:
+                logger.info(
+                    "Resolving %d accepted observations in-memory",
+                    len(quality_report.accepted_records),
+                )
+                res_result = self.resolver.resolve_observations(
+                    quality_report.accepted_records,
+                    existing_events=[],
+                    existing_event_observations={},
+                )
+                events_synthesized = len(res_result.resolved_events)
+                res_summary = {
+                    "total_observations": res_result.total_observations,
+                    "events_created": res_result.events_created,
+                    "events_updated": res_result.events_updated,
+                    "observations_assigned": res_result.observations_assigned,
+                    "ambiguous_count": res_result.ambiguous_count,
+                    "merge_candidates_count": len(res_result.merge_candidates),
+                    "resolved_events_count": len(res_result.resolved_events),
+                }
 
         # 6. Report
         return ETLPipelineResult(

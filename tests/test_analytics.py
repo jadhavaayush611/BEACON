@@ -10,6 +10,10 @@ from beacon.analytics.service import AnalyticsService
 from beacon.models import (
     ConflictingClaim,
     DisasterObservation,
+    ExtractionMethod,
+    ExtractionStatus,
+    SourceRecord,
+    SourceType,
     UnifiedDisasterEvent,
 )
 from beacon.storage.repository import StorageRepository
@@ -388,3 +392,160 @@ class TestAnalyticsService:
         # Latest audit event (idempotent_re_observation) must appear first
         assert decisions[0]["decision_type"] == "idempotent_re_observation"
         assert decisions[1]["decision_type"] == "confident_match"
+
+    def test_unassigned_ambiguous_observation_lifecycle_and_queries(
+        self, analytics_service: AnalyticsService
+    ) -> None:
+        """Verify unassigned ambiguous observations are traceable, queried, and summarized accurately."""
+        from sqlalchemy.orm import sessionmaker
+        from beacon.resolution.models import DecisionType, ResolutionOutcome, ResolutionResult
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        repo = StorageRepository()
+        factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+        with factory() as session:
+            # 1. Store a source record
+            src = SourceRecord(
+                source_id="src_ambig_test",
+                source_file="data/raw/ambig.json",
+                source_type=SourceType.JSON,
+                extraction_method=ExtractionMethod.JSON_PARSE,
+                content_hash="a" * 64,
+                extraction_status=ExtractionStatus.SUCCESS,
+                ingested_at=datetime.now(timezone.utc),
+            )
+            repo.save_source(src, session)
+
+            # 2. Store an observation that will be ambiguous
+            obs_ambig = DisasterObservation(
+                observation_id="obs_ambig_001",
+                source_id=src.source_id,
+                event_type="flood",
+                location="Border Zone",
+                event_time=datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+                severity="moderate",
+            )
+            repo.save_observations([obs_ambig], session)
+
+            # 3. Save resolution result with ambiguous decision (assigned_event_id=None)
+            decision = ResolutionOutcome(
+                observation_id=obs_ambig.observation_id,
+                assigned_event_id=None,
+                decision=DecisionType.AMBIGUOUS_CANDIDATE,
+                score=0.45,
+                is_new_event=False,
+                rationale="Candidate score below threshold; quarantined for review.",
+            )
+            res_result = ResolutionResult(
+                resolved_events=[],
+                outcomes=[decision],
+                merge_candidates=[],
+            )
+            repo.save_resolution_result(res_result, session)
+            session.commit()
+
+            # 4. Verify observation is unassigned via repository queries
+            unassigned = repo.get_unassigned_observations(session)
+            assert len(unassigned) == 1
+            assert unassigned[0].observation_id == "obs_ambig_001"
+
+            unassigned_with_dec = repo.get_unassigned_observations_with_decisions(session)
+            assert len(unassigned_with_dec) == 1
+            assert unassigned_with_dec[0]["observation"].observation_id == "obs_ambig_001"
+            assert unassigned_with_dec[0]["decision"]["decision_type"] == "ambiguous_candidate"
+            assert unassigned_with_dec[0]["decision"]["rationale"] == "Candidate score below threshold; quarantined for review."
+
+            # 5. Verify analytics summary counts ambiguous observations
+            summary = analytics_service.summarize_db(session)
+            assert summary.total_events == 0
+            assert summary.total_observations == 1
+            assert summary.ambiguous_observations_count == 1
+
+            # 6. Verify event-filtered summary does not misattribute to arbitrary event
+            flt = AnalyticsFilter(event_type="earthquake")
+            filtered_summary = analytics_service.summarize_db(session, filter_criteria=flt)
+            assert filtered_summary.total_events == 0
+            assert filtered_summary.total_observations == 0
+
+    def test_unassigned_observation_later_assignment(
+        self
+    ) -> None:
+        """Verify an unassigned observation can later be assigned when corroborating evidence matches."""
+        from sqlalchemy.orm import sessionmaker
+        from beacon.resolution.models import DecisionType, ResolutionOutcome, ResolutionResult
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        repo = StorageRepository()
+        factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+        with factory() as session:
+            src = SourceRecord(
+                source_id="src_later_test",
+                source_file="data/raw/later.json",
+                source_type=SourceType.JSON,
+                extraction_method=ExtractionMethod.JSON_PARSE,
+                content_hash="b" * 64,
+                extraction_status=ExtractionStatus.SUCCESS,
+                ingested_at=datetime.now(timezone.utc),
+            )
+            repo.save_source(src, session)
+
+            obs = DisasterObservation(
+                observation_id="obs_later_001",
+                source_id=src.source_id,
+                event_type="wildfire",
+                location="Timber Ridge",
+                event_time=datetime(2026, 7, 10, 14, 0, tzinfo=timezone.utc),
+                severity="moderate",
+            )
+            repo.save_observations([obs], session)
+
+            # Initially ambiguous
+            d_init = ResolutionOutcome(
+                observation_id=obs.observation_id,
+                assigned_event_id=None,
+                decision=DecisionType.AMBIGUOUS_CANDIDATE,
+                score=0.48,
+                is_new_event=False,
+                rationale="Uncertain match initially.",
+            )
+            repo.save_resolution_result(
+                ResolutionResult(resolved_events=[], outcomes=[d_init], merge_candidates=[]),
+                session,
+            )
+            session.commit()
+
+            assert len(repo.get_unassigned_observations(session)) == 1
+
+            # Later assignment to a confirmed event
+            ev = UnifiedDisasterEvent(
+                event_id="evt_timber_ridge",
+                event_type="wildfire",
+                location="Timber Ridge",
+                start_time=datetime(2026, 7, 10, 14, 0, tzinfo=timezone.utc),
+                summary="Timber Ridge Wildfire Event.",
+                observation_ids=[obs.observation_id],
+                source_ids=[src.source_id],
+                created_at=datetime.now(timezone.utc),
+                updated_at=datetime.now(timezone.utc),
+            )
+            d_match = ResolutionOutcome(
+                observation_id=obs.observation_id,
+                assigned_event_id=ev.event_id,
+                decision=DecisionType.CONFIDENT_MATCH,
+                score=0.95,
+                is_new_event=False,
+                rationale="Corroborated by high-confidence ground report.",
+            )
+            repo.save_resolution_result(
+                ResolutionResult(resolved_events=[ev], outcomes=[d_match], merge_candidates=[]),
+                session,
+            )
+            session.commit()
+
+            # Now observation is assigned: get_unassigned_observations must return 0
+            assert len(repo.get_unassigned_observations(session)) == 0
+            assert len(repo.get_unassigned_observations(session)) == 0

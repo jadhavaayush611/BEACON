@@ -167,6 +167,27 @@ class TestJsonIngestion:
         assert res.processed_count == 0
         assert len(res.observations) == 0
 
+    def test_empty_json_file_fails(self, tmp_path: Path) -> None:
+        empty_file = tmp_path / "empty_file.json"
+        empty_file.write_text("", encoding="utf-8")
+        res = ingest_file(empty_file)
+        assert res.status == ExtractionStatus.FAILED
+        assert any("empty or whitespace" in err for err in res.errors)
+
+    def test_whitespace_only_json_file_fails(self, tmp_path: Path) -> None:
+        ws_file = tmp_path / "ws_file.json"
+        ws_file.write_text("   \n\t  \n", encoding="utf-8")
+        res = ingest_file(ws_file)
+        assert res.status == ExtractionStatus.FAILED
+        assert any("empty or whitespace" in err for err in res.errors)
+
+    def test_invalid_utf8_json_file_fails(self, tmp_path: Path) -> None:
+        bad_utf8 = tmp_path / "bad_utf8.json"
+        bad_utf8.write_bytes(b'{"key": "\xff\xfe\x00\x00"}')
+        res = ingest_file(bad_utf8)
+        assert res.status == ExtractionStatus.FAILED
+        assert any("Invalid character encoding" in err for err in res.errors)
+
 
 # ==============================================================================
 # 3. CSV Ingestion Tests
@@ -224,6 +245,34 @@ class TestCsvIngestion:
         assert res.status == ExtractionStatus.SUCCESS
         assert res.processed_count == 0
         assert len(res.observations) == 0
+
+    def test_completely_empty_csv(self, tmp_path: Path) -> None:
+        empty_csv = tmp_path / "zero_bytes.csv"
+        empty_csv.write_text("", encoding="utf-8")
+
+        res = ingest_file(empty_csv)
+        assert res.status == ExtractionStatus.SUCCESS
+        assert res.processed_count == 0
+        assert len(res.observations) == 0
+        assert any("empty or contains no rows" in w for w in res.warnings)
+
+    def test_whitespace_only_csv(self, tmp_path: Path) -> None:
+        ws_csv = tmp_path / "whitespace.csv"
+        ws_csv.write_text("   \n\r\n  \t  \n", encoding="utf-8")
+
+        res = ingest_file(ws_csv)
+        assert res.status == ExtractionStatus.SUCCESS
+        assert res.processed_count == 0
+        assert len(res.observations) == 0
+        assert any("empty or contains no rows" in w for w in res.warnings)
+
+    def test_invalid_utf8_csv_fails(self, tmp_path: Path) -> None:
+        bad_utf8 = tmp_path / "bad_utf8.csv"
+        bad_utf8.write_bytes(b"record_id,event_type,location\n1,flood,\xff\xfe\x00\n")
+
+        res = ingest_file(bad_utf8)
+        assert res.status == ExtractionStatus.FAILED
+        assert any("Invalid character encoding" in err for err in res.errors)
 
 
 # ==============================================================================
@@ -287,6 +336,14 @@ class TestTxtIngestion:
         assert res.processed_count == 0
         assert len(res.observations) == 0
         assert any("No structured [REPORT ...] incident blocks" in w for w in res.warnings)
+
+    def test_invalid_utf8_txt_fails(self, tmp_path: Path) -> None:
+        bad_utf8 = tmp_path / "bad_utf8.txt"
+        bad_utf8.write_bytes(b"[REPORT 001]\nEVENT: \xff\xfe\x00\nLOCATION: Lake\n")
+
+        res = ingest_file(bad_utf8)
+        assert res.status == ExtractionStatus.FAILED
+        assert any("Invalid character encoding" in err for err in res.errors)
 
 
 # ==============================================================================
@@ -400,6 +457,19 @@ class TestPdfIngestion:
         res = ingest_file(corrupt_pdf)
         assert res.status == ExtractionStatus.FAILED
         assert any("Failed to open or parse PDF" in err for err in res.errors)
+
+    def test_pdf_resource_cleanup_on_success_and_failure(self, tmp_path: Path) -> None:
+        """Verify file streams are deterministically closed on both success and failure."""
+        damaged_pdf = tmp_path / "damaged_cleanup.pdf"
+        damaged_pdf.write_bytes(b"%PDF-1.4\ncorrupt content")
+
+        ingestor = PdfIngestor()
+        res_fail = ingestor.ingest(damaged_pdf)
+        assert res_fail.status == ExtractionStatus.FAILED
+
+        # Re-opening / deleting the file immediately should succeed without file lock errors
+        damaged_pdf.unlink()
+        assert not damaged_pdf.exists()
 
 
 # ==============================================================================

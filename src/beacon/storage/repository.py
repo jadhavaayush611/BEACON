@@ -2,7 +2,7 @@
 
 from datetime import datetime, timezone
 import logging
-from typing import Optional, Sequence
+from typing import Any, Optional, Sequence
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -583,3 +583,88 @@ class StorageRepository:
             )
             for m in models
         ]
+
+    def get_unassigned_observations(
+        self,
+        session: Session,
+    ) -> list[DisasterObservation]:
+        """Query observations not linked to any unified event profile."""
+        linked_subquery = select(EventObservationModel.observation_id)
+        stmt = (
+            select(ObservationModel)
+            .where(ObservationModel.observation_id.not_in(linked_subquery))
+            .order_by(ObservationModel.created_at.desc())
+        )
+        models = session.execute(stmt).scalars().all()
+        return [
+            DisasterObservation(
+                observation_id=m.observation_id,
+                source_id=m.source_id,
+                event_type=m.event_type,
+                location=m.location,
+                event_time=_ensure_utc(m.event_time),
+                description=m.description,
+                severity=m.severity,
+                latitude=m.latitude,
+                longitude=m.longitude,
+                extraction_confidence=m.extraction_confidence,
+                page_number=m.page_number,
+                source_reference=m.source_reference,
+                raw_claim=m.raw_claim,
+                validation_warnings=list(m.validation_warnings or []),
+            )
+            for m in models
+        ]
+
+    def get_unassigned_observations_with_decisions(
+        self,
+        session: Session,
+    ) -> list[dict[str, Any]]:
+        """Query unassigned observations paired with their audit resolution decisions."""
+        linked_subquery = select(EventObservationModel.observation_id)
+        stmt = (
+            select(ObservationModel)
+            .where(ObservationModel.observation_id.not_in(linked_subquery))
+            .order_by(ObservationModel.created_at.desc())
+        )
+        models = session.execute(stmt).scalars().all()
+        results: list[dict[str, Any]] = []
+
+        for m in models:
+            obs = DisasterObservation(
+                observation_id=m.observation_id,
+                source_id=m.source_id,
+                event_type=m.event_type,
+                location=m.location,
+                event_time=_ensure_utc(m.event_time),
+                description=m.description,
+                severity=m.severity,
+                latitude=m.latitude,
+                longitude=m.longitude,
+                extraction_confidence=m.extraction_confidence,
+                page_number=m.page_number,
+                source_reference=m.source_reference,
+                raw_claim=m.raw_claim,
+                validation_warnings=list(m.validation_warnings or []),
+            )
+            dec_stmt = (
+                select(ResolutionDecisionModel)
+                .where(ResolutionDecisionModel.observation_id == m.observation_id)
+                .order_by(ResolutionDecisionModel.created_at.desc())
+            )
+            dec_model = session.execute(dec_stmt).scalars().first()
+            dec_data: Optional[dict[str, Any]] = None
+            if dec_model:
+                dec_data = {
+                    "decision_type": dec_model.decision_type,
+                    "composite_score": dec_model.composite_score,
+                    "rationale": dec_model.rationale,
+                    "feature_scores": dec_model.feature_scores,
+                    "created_at": _ensure_utc(dec_model.created_at),
+                }
+            results.append({
+                "observation": obs,
+                "decision": dec_data,
+            })
+
+        return results

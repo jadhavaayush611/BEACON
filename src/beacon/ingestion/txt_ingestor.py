@@ -55,6 +55,23 @@ class TxtIngestor(BaseIngestor):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 content = f.read()
+        except UnicodeDecodeError as err:
+            err_msg = f"Invalid character encoding in '{path.name}': {err}. Expected UTF-8."
+            logger.error("TXT encoding error: %s", err_msg)
+            source_rec = self.create_source_record(
+                path=path,
+                content_hash=content_hash,
+                status=ExtractionStatus.FAILED,
+                metadata={"file_size": file_size, "parse_error": "UnicodeDecodeError"},
+            )
+            return IngestionResult(
+                source_record=source_rec,
+                status=ExtractionStatus.FAILED,
+                errors=[err_msg],
+                processed_count=0,
+                accepted_count=0,
+                rejected_count=0,
+            )
         except Exception as err:
             err_msg = f"Failed to read TXT file '{path.name}': {err}"
             logger.error("TXT read error: %s", err_msg)

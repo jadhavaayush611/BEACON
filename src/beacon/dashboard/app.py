@@ -10,6 +10,10 @@ import streamlit as st
 
 from beacon.analytics.models import AnalyticsFilter
 from beacon.config import get_settings
+from beacon.dashboard.components import (
+    extract_geographic_dataframe,
+    inject_custom_styles,
+)
 from beacon.dashboard.formatters import (
     explain_compression_ratio,
     format_compression_ratio,
@@ -17,9 +21,14 @@ from beacon.dashboard.formatters import (
     format_conflict_claim_row,
     format_decision_row,
     format_observation_row,
+    format_score,
+    format_timestamp,
 )
 from beacon.dashboard.services import DashboardService
+from beacon.logging_config import setup_logging
 from beacon.models import STANDARD_EVENT_TYPES, SeverityLevel
+
+setup_logging()
 
 # Page configuration
 st.set_page_config(
@@ -28,6 +37,9 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# Apply BEACON Design System CSS
+inject_custom_styles()
 
 
 @st.cache_resource
@@ -173,8 +185,39 @@ with tab_overview:
             ],
         })
 
+    st.markdown("---")
+
+    # Geospatial Context & Recent Incident Feed
+    events_for_overview = service.query_events()
+    geo_df = extract_geographic_dataframe(events_for_overview)
+
     if total_ev == 0:
         st.info("💡 **Empty State:** No disaster events currently loaded. Navigate to **Ingestion** or **Pipeline Execution** to process sample files.")
+    else:
+        g_col1, g_col2 = st.columns([1, 1])
+        with g_col1:
+            st.subheader("🗺️ Geospatial Disaster Distribution")
+            if len(geo_df) > 0:
+                st.map(geo_df[["latitude", "longitude"]])
+                st.caption(f"Mapped **{len(geo_df)}** event centroid(s) across affected territories.")
+            else:
+                st.caption("No geospatial coordinate centroids available in current events.")
+
+        with g_col2:
+            st.subheader("📡 Recent Disaster Intelligence Feed")
+            feed_rows = [
+                {
+                    "Event ID": ev.event_id,
+                    "Type": ev.event_type.upper(),
+                    "Location": ev.location,
+                    "Severity": ev.severity or "unspecified",
+                    "Start Time": format_timestamp(ev.start_time),
+                    "Sources": len(ev.source_ids),
+                    "Corroboration": "Multi-Source" if len(ev.source_ids) > 1 else "Single-Source",
+                }
+                for ev in events_for_overview[:8]
+            ]
+            st.dataframe(feed_rows, width="stretch")
 
 # ==============================================================================
 # TAB 2: INGESTION
@@ -353,7 +396,7 @@ with tab_events:
     st.write("Browse and audit canonical unified disaster profiles and their constituent observations.")
 
     # Filters
-    f_col1, f_col2, f_col3 = st.columns(3)
+    f_col1, f_col2, f_col3, f_col4 = st.columns(4)
     with f_col1:
         type_filter = st.selectbox(
             "Filter by Event Type:",
@@ -366,6 +409,11 @@ with tab_events:
         )
     with f_col3:
         loc_search = st.text_input("Search Location:", placeholder="e.g. Riverside")
+    with f_col4:
+        corrob_filter = st.selectbox(
+            "Filter Corroboration:",
+            options=["All", "Multi-Source Only", "Single-Source Only"],
+        )
 
     criteria = AnalyticsFilter(
         event_type=type_filter if type_filter != "All" else None,
@@ -374,11 +422,18 @@ with tab_events:
     )
 
     events = service.query_events(criteria)
+    if corrob_filter == "Multi-Source Only":
+        events = [e for e in events if len(e.source_ids) > 1]
+    elif corrob_filter == "Single-Source Only":
+        events = [e for e in events if len(e.source_ids) <= 1]
+
     st.write(f"Found **{len(events)}** matching unified event(s):")
 
     if events:
         for ev in events:
-            with st.expander(f"📍 {ev.event_type.upper()} in {ev.location} ({ev.event_id})"):
+            status_tag = "MULTI-SOURCE" if len(ev.source_ids) > 1 else "SINGLE-SOURCE"
+            conflict_tag = f"⚠️ {len(ev.conflicting_claims)} CONFLICT(S)" if ev.conflicting_claims else "CLEAN"
+            with st.expander(f"📍 {ev.event_type.upper()} in {ev.location} ({ev.event_id}) — [{status_tag}] [{conflict_tag}]"):
                 ec1, ec2 = st.columns([2, 1])
                 with ec1:
                     st.write(f"**Summary:** {ev.summary}")
@@ -394,7 +449,11 @@ with tab_events:
                     centroid = (ev.metadata or {}).get("centroid")
                     bbox = (ev.metadata or {}).get("bounding_box")
                     if centroid and centroid.get("latitude") is not None and centroid.get("longitude") is not None:
-                        st.write(f"**Centroid:** `{centroid['latitude']}, {centroid['longitude']}`")
+                        st.write(f"**Centroid:** `({centroid['latitude']}, {centroid['longitude']})`")
+                        st.map(
+                            pd.DataFrame([{"latitude": float(centroid["latitude"]), "longitude": float(centroid["longitude"])}]),
+                            zoom=6,
+                        )
                     if (
                         bbox
                         and bbox.get("min_latitude") is not None
@@ -441,6 +500,35 @@ with tab_events:
                     st.dataframe(dec_rows, width="stretch")
     else:
         st.info("No unified events match the current filter criteria.")
+
+    # Unassigned and ambiguous observations audit section
+    unassigned = service.get_unassigned_observations()
+    if unassigned:
+        st.markdown("---")
+        with st.expander(
+            f"⚠️ Unassigned & Ambiguous Observations ({len(unassigned)}) — Quarantined for Audit",
+            expanded=False,
+        ):
+            st.caption(
+                "These observations have been validated and persisted, but could not be confidently linked to a single "
+                "unified event profile due to score ambiguity or near-tie candidates. They remain unassigned and "
+                "quarantined pending further corroborating evidence or manual review."
+            )
+            u_rows = []
+            for item in unassigned:
+                obs = item["observation"]
+                dec = item.get("decision") or {}
+                u_rows.append({
+                    "Obs ID": obs.observation_id,
+                    "Source ID": obs.source_id,
+                    "Type": obs.event_type,
+                    "Location": obs.location or "N/A",
+                    "Timestamp": format_timestamp(obs.event_time),
+                    "Decision": dec.get("decision_type", "unassigned"),
+                    "Score": format_score(dec.get("composite_score")),
+                    "Rationale": dec.get("rationale", "No resolution decision recorded"),
+                })
+            st.dataframe(u_rows, width="stretch")
 
 # ==============================================================================
 # TAB 5: ANALYTICS

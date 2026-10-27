@@ -74,6 +74,7 @@ class DashboardService:
         # In-memory storage for file-based runs when database is not connected
         self._in_memory_events: list[UnifiedDisasterEvent] = []
         self._in_memory_observations: list[DisasterObservation] = []
+        self._in_memory_resolution_outcomes: list[Any] = []
         self._last_pipeline_result: Optional[ETLPipelineResult] = None
 
     @property
@@ -224,9 +225,14 @@ class DashboardService:
                 )
 
         # Fallback to in-memory state if DB is not connected
+        in_mem_ambig = sum(
+            1 for out in self._in_memory_resolution_outcomes
+            if getattr(out, "decision", None) and getattr(out.decision, "value", str(out.decision)) == "ambiguous_candidate"
+        )
         summary = self.analytics_service.summarize(
             events=self._in_memory_events,
             observations=self._in_memory_observations,
+            ambiguous_count=in_mem_ambig,
         )
         sources = {o.source_id for o in self._in_memory_observations}
         return {
@@ -320,6 +326,7 @@ class DashboardService:
                     existing_event_observations=in_memory_obs_by_event,
                 )
                 self._in_memory_events = res_out.resolved_events
+                self._in_memory_resolution_outcomes = res_out.outcomes
 
         return result
 
@@ -440,6 +447,42 @@ class DashboardService:
             "observations": constituent_obs,
             "decisions": [],
         }
+
+    def get_unassigned_observations(self) -> list[dict[str, Any]]:
+        """Fetch observations not assigned to any unified event profile."""
+        if self.is_database_connected:
+            assert self.session_factory is not None
+            try:
+                with get_session(self.session_factory) as session:
+                    return self.repository.get_unassigned_observations_with_decisions(session)
+            except Exception as err:
+                logger.warning("Could not fetch unassigned observations from database: %s", err)
+
+        # In-memory fallback
+        assigned_obs_ids = {
+            oid for ev in self._in_memory_events for oid in ev.observation_ids
+        }
+        unassigned_obs = [
+            o for o in self._in_memory_observations if o.observation_id not in assigned_obs_ids
+        ]
+        decision_map = {
+            out.observation_id: {
+                "decision_type": getattr(out.decision, "value", str(out.decision)),
+                "composite_score": out.score,
+                "rationale": out.rationale,
+                "feature_scores": out.feature_scores.model_dump() if out.feature_scores else {},
+                "created_at": None,
+            }
+            for out in self._in_memory_resolution_outcomes
+        }
+        results = []
+        for o in unassigned_obs:
+            dec = decision_map.get(o.observation_id)
+            results.append({
+                "observation": o,
+                "decision": dec,
+            })
+        return results
 
     def get_analytics_summary(
         self, filter_criteria: Optional[AnalyticsFilter] = None

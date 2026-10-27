@@ -33,7 +33,41 @@ class JsonIngestor(BaseIngestor):
         try:
             with open(path, "r", encoding="utf-8") as f:
                 raw_text = f.read()
-                data = json.loads(raw_text)
+            if not raw_text.strip():
+                err_msg = f"JSON file '{path.name}' is empty or whitespace-only."
+                logger.error("JSON empty error in '%s': %s", path.name, err_msg)
+                source_rec = self.create_source_record(
+                    path=path,
+                    content_hash=content_hash,
+                    status=ExtractionStatus.FAILED,
+                    metadata={"file_size": file_size, "parse_error": "EmptyFileError"},
+                )
+                return IngestionResult(
+                    source_record=source_rec,
+                    status=ExtractionStatus.FAILED,
+                    errors=[err_msg],
+                    processed_count=0,
+                    accepted_count=0,
+                    rejected_count=0,
+                )
+            data = json.loads(raw_text)
+        except UnicodeDecodeError as err:
+            err_msg = f"Invalid character encoding in '{path.name}': {err}. Expected UTF-8."
+            logger.error("JSON encoding error in '%s': %s", path.name, err_msg)
+            source_rec = self.create_source_record(
+                path=path,
+                content_hash=content_hash,
+                status=ExtractionStatus.FAILED,
+                metadata={"file_size": file_size, "parse_error": "UnicodeDecodeError"},
+            )
+            return IngestionResult(
+                source_record=source_rec,
+                status=ExtractionStatus.FAILED,
+                errors=[err_msg],
+                processed_count=0,
+                accepted_count=0,
+                rejected_count=0,
+            )
         except json.JSONDecodeError as err:
             err_msg = f"Malformed JSON syntax at line {err.lineno}, column {err.colno}: {err.msg}"
             logger.error("JSON decode error in '%s': %s", path.name, err_msg)

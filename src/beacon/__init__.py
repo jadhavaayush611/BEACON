@@ -4,6 +4,7 @@
 """
 
 from beacon.config import Settings, get_settings
+from beacon.logging_config import setup_logging
 from beacon.ingestion import IngestionResult, ingest_file
 from beacon.models import (
     STANDARD_EVENT_TYPES,
@@ -45,6 +46,7 @@ __all__ = [
     "__version__",
     "Settings",
     "get_settings",
+    "setup_logging",
     "ingest_file",
     "IngestionResult",
     "ETLRunner",

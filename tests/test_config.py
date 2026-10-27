@@ -92,3 +92,37 @@ class TestLoggingSubsystem:
         assert record.msg["auth_token"] == "[REDACTED]"
         assert record.msg["nested"]["password"] == "[REDACTED]"
         assert record.msg["nested"]["normal_field"] == "safe_value"
+
+    def test_sensitive_data_filter_redacts_database_urls(self) -> None:
+        data_filter = SensitiveDataFilter()
+        raw_msg = "Connecting to postgresql://beacon_user:super_secret_pw@localhost:5432/beacon_dev for pipeline"
+        record = logging.LogRecord(
+            name="beacon.test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=30,
+            msg=raw_msg,
+            args=(),
+            exc_info=None,
+        )
+        assert data_filter.filter(record) is True
+        assert "super_secret_pw" not in record.msg
+        assert "postgresql://beacon_user:[REDACTED]@localhost:5432/beacon_dev" in record.msg
+
+    def test_sensitive_data_filter_redacts_query_parameters(self) -> None:
+        data_filter = SensitiveDataFilter()
+        raw_msg = "Fetching from https://api.disaster.org/v1/feed?token=xyz987654321&status=active&password=mysecretword"
+        record = logging.LogRecord(
+            name="beacon.test",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=40,
+            msg=raw_msg,
+            args=(),
+            exc_info=None,
+        )
+        assert data_filter.filter(record) is True
+        assert "xyz987654321" not in record.msg
+        assert "mysecretword" not in record.msg
+        assert "token=[REDACTED]" in record.msg
+        assert "password=[REDACTED]" in record.msg

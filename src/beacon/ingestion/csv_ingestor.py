@@ -32,9 +32,44 @@ class CsvIngestor(BaseIngestor):
 
         try:
             with open(path, "r", encoding="utf-8-sig", newline="") as f:
-                reader = csv.DictReader(f)
-                headers = reader.fieldnames or []
-                rows = list(reader)
+                content = f.read()
+            if not content.strip():
+                source_rec = self.create_source_record(
+                    path=path,
+                    content_hash=content_hash,
+                    status=ExtractionStatus.SUCCESS,
+                    metadata={"file_size": file_size, "headers": [], "total_rows": 0},
+                )
+                return IngestionResult(
+                    source_record=source_rec,
+                    observations=[],
+                    status=ExtractionStatus.SUCCESS,
+                    errors=[],
+                    warnings=[f"CSV file '{path.name}' is empty or contains no rows."],
+                    processed_count=0,
+                    accepted_count=0,
+                    rejected_count=0,
+                )
+            reader = csv.DictReader(content.splitlines())
+            headers = reader.fieldnames or []
+            rows = list(reader)
+        except UnicodeDecodeError as err:
+            err_msg = f"Invalid character encoding in '{path.name}': {err}. Expected UTF-8."
+            logger.error("CSV encoding error: %s", err_msg)
+            source_rec = self.create_source_record(
+                path=path,
+                content_hash=content_hash,
+                status=ExtractionStatus.FAILED,
+                metadata={"file_size": file_size, "parse_error": "UnicodeDecodeError"},
+            )
+            return IngestionResult(
+                source_record=source_rec,
+                status=ExtractionStatus.FAILED,
+                errors=[err_msg],
+                processed_count=0,
+                accepted_count=0,
+                rejected_count=0,
+            )
         except Exception as err:
             err_msg = f"Failed to read CSV file '{path.name}': {err}"
             logger.error("CSV read error: %s", err_msg)

@@ -9,6 +9,7 @@ import sys
 from typing import Optional, Sequence
 
 from beacon.config import get_settings
+from beacon.logging_config import setup_logging
 from beacon.storage import create_db_engine, drop_db, init_db
 
 
@@ -50,6 +51,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = parser.parse_args(argv)
 
     settings = get_settings()
+    setup_logging(settings)
     url = args.url or settings.database_url
     if not url:
         print(

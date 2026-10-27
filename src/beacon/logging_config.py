@@ -30,11 +30,24 @@ class SensitiveDataFilter(logging.Filter):
 
     def _redact_string(self, text: str) -> str:
         # Redact common key=value or key: value tokens
-        return re.sub(
-            r"(?i)\b(password|secret|token|api[_-]?key|auth|authorization)\s*[:=]\s*([^\s,;]+)",
+        redacted = re.sub(
+            r"(?i)\b(password|secret|token|api[_-]?key|auth|authorization)\s*[:=]\s*([^\s,;&]+)",
             r"\1=[REDACTED]",
             text,
         )
+        # Redact database connection URLs containing user credentials (e.g. postgresql://user:pass@host/db)
+        redacted = re.sub(
+            r"://([^:@\s]+):([^@\s]+)@",
+            r"://\1:[REDACTED]@",
+            redacted,
+        )
+        # Redact sensitive query parameters (e.g. ?token=xyz or &key=abc)
+        redacted = re.sub(
+            r"(?i)([?&](?:password|token|key|secret|auth)=)[^&\s]+",
+            r"\1[REDACTED]",
+            redacted,
+        )
+        return redacted
 
     def _redact_dict(self, data: dict[str, Any]) -> dict[str, Any]:
         redacted = {}
@@ -70,14 +83,18 @@ def setup_logging(settings: Optional[Settings] = None) -> logging.Logger:
     cfg = settings or get_settings()
 
     logger = logging.getLogger("beacon")
-    logger.setLevel(getattr(logging, cfg.log_level.upper(), logging.INFO))
+    raw_level = getattr(cfg, "log_level", "INFO")
+    level_name = raw_level.upper() if isinstance(raw_level, str) else "INFO"
+    level = getattr(logging, level_name, logging.INFO)
+    logger.setLevel(level)
 
     # Avoid duplicate handlers if setup_logging is called repeatedly
     if not logger.handlers:
         handler = logging.StreamHandler()
-        handler.setLevel(getattr(logging, cfg.log_level.upper(), logging.INFO))
+        handler.setLevel(level)
 
-        if cfg.log_format.lower() == "json":
+        raw_format = getattr(cfg, "log_format", "text")
+        if isinstance(raw_format, str) and raw_format.lower() == "json":
             formatter = JsonFormatter()
         else:
             formatter = logging.Formatter(
