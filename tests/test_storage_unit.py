@@ -212,6 +212,41 @@ class TestStorageRepositoryUnit:
             assert results[0].rule_name == "COORDINATES_PAIRED"
             assert results[0].severity == "warning"
 
+    def test_repeated_save_quality_results_appends_audit_history(
+        self, db_session_factory: sessionmaker, repository: StorageRepository
+    ) -> None:
+        """Verify repeated saves of quality outcomes append legitimate audit history over time."""
+        outcome = ValidationOutcome(
+            record_id="obs_audit_001",
+            source_id="src_audit_001",
+            rule_name="CONFIDENCE_BOUNDS",
+            severity=RuleSeverity.ERROR,
+            message="Confidence out of bounds",
+            passed=False,
+            details={"confidence": 1.5},
+        )
+
+        # Initial validation run
+        with get_session(db_session_factory) as session:
+            c1 = repository.save_quality_results([outcome], session)
+            assert c1 == 1
+
+        with get_session(db_session_factory) as session:
+            rows1 = session.execute(select(QualityResultModel)).scalars().all()
+            assert len(rows1) == 1
+
+        # Subsequent validation run on re-ingested source
+        with get_session(db_session_factory) as session:
+            c2 = repository.save_quality_results([outcome], session)
+            assert c2 == 1
+
+        with get_session(db_session_factory) as session:
+            rows2 = session.execute(select(QualityResultModel)).scalars().all()
+            # Legitimate append-only audit history preserves both validation events
+            assert len(rows2) == 2
+            assert rows2[0].id != rows2[1].id
+            assert rows2[0].rule_name == rows2[1].rule_name == "CONFIDENCE_BOUNDS"
+
     def test_save_batch_atomic(
         self, db_session_factory: sessionmaker, repository: StorageRepository
     ) -> None:

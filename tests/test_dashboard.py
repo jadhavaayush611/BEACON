@@ -5,7 +5,7 @@ event querying, analytics, and database diagnostic services without requiring a 
 """
 
 from collections.abc import Generator
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import pytest
 from sqlalchemy import create_engine
@@ -34,7 +34,7 @@ from beacon.models import (
     SourceType,
     UnifiedDisasterEvent,
 )
-from beacon.storage import StorageRepository, drop_db, init_db
+from beacon.storage import ResolutionDecisionModel, StorageRepository, drop_db, init_db
 
 
 def _can_create_socketpair() -> bool:
@@ -435,6 +435,106 @@ class TestDashboardService:
         assert detail is not None
         matched_obs = next(o for o in detail["observations"] if o.observation_id == "obs_d_none")
         assert matched_obs.extraction_confidence is None
+
+    def test_get_event_detail_deterministic_decision_ordering_on_identical_timestamps(
+        self, dashboard_service: DashboardService, sample_events: list[UnifiedDisasterEvent]
+    ) -> None:
+        """Resolution decisions must order primarily by created_at.desc() and secondarily by id.desc()."""
+        repo = StorageRepository()
+        src = SourceRecord(
+            source_id="src_d_order",
+            source_file="order.json",
+            source_type=SourceType.JSON,
+            extraction_method=ExtractionMethod.JSON_PARSE,
+            ingested_at=datetime.now(timezone.utc),
+            extraction_status=ExtractionStatus.SUCCESS,
+            content_hash="d" * 64,
+        )
+        obs1 = DisasterObservation(
+            observation_id="obs_d_ord_1",
+            source_id="src_d_order",
+            event_type="flood",
+            location="Riverside Metro",
+        )
+        obs2 = DisasterObservation(
+            observation_id="obs_d_ord_2",
+            source_id="src_d_order",
+            event_type="flood",
+            location="Riverside Metro",
+        )
+        obs3 = DisasterObservation(
+            observation_id="obs_d_ord_3",
+            source_id="src_d_order",
+            event_type="flood",
+            location="Riverside Metro",
+        )
+        obs4 = DisasterObservation(
+            observation_id="obs_d_ord_4",
+            source_id="src_d_order",
+            event_type="flood",
+            location="Riverside Metro",
+        )
+        t_base = datetime(2026, 5, 15, 12, 0, 0, tzinfo=timezone.utc)
+        t_older = t_base - timedelta(hours=1)
+        t_newer = t_base + timedelta(hours=1)
+
+        with dashboard_service.session_factory() as session:
+            repo.save_source(src, session)
+            repo.save_observations([obs1, obs2, obs3, obs4], session)
+            repo.save_event(sample_events[0], session)
+            for o in [obs1, obs2, obs3, obs4]:
+                repo.link_observation_to_event(sample_events[0].event_id, o.observation_id, 0.95, session)
+
+            d_old = ResolutionDecisionModel(
+                observation_id=obs1.observation_id,
+                event_id=sample_events[0].event_id,
+                decision_type="matched_existing",
+                composite_score=0.70,
+                feature_scores={},
+                rationale="old_decision",
+                created_at=t_older,
+            )
+            d_mid1 = ResolutionDecisionModel(
+                observation_id=obs2.observation_id,
+                event_id=sample_events[0].event_id,
+                decision_type="matched_existing",
+                composite_score=0.80,
+                feature_scores={},
+                rationale="mid_decision_lower_id",
+                created_at=t_base,
+            )
+            d_mid2 = ResolutionDecisionModel(
+                observation_id=obs3.observation_id,
+                event_id=sample_events[0].event_id,
+                decision_type="matched_existing",
+                composite_score=0.85,
+                feature_scores={},
+                rationale="mid_decision_higher_id",
+                created_at=t_base,
+            )
+            d_new = ResolutionDecisionModel(
+                observation_id=obs4.observation_id,
+                event_id=sample_events[0].event_id,
+                decision_type="matched_existing",
+                composite_score=0.95,
+                feature_scores={},
+                rationale="new_decision",
+                created_at=t_newer,
+            )
+            session.add_all([d_old, d_mid1, d_mid2, d_new])
+            session.commit()
+
+        detail = dashboard_service.get_event_detail("evt_dash_01")
+        assert detail is not None
+        assert len(detail["decisions"]) == 4
+
+        rationales = [d["rationale"] for d in detail["decisions"]]
+        assert rationales == [
+            "new_decision",
+            "mid_decision_higher_id",
+            "mid_decision_lower_id",
+            "old_decision",
+        ]
 
     def test_app_headless_runs_complete_pipeline_without_exception(
         self, isolate_in_memory_dashboard: None

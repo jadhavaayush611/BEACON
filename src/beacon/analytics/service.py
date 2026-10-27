@@ -225,7 +225,7 @@ class AnalyticsService:
                     obs_missing_times = 0
 
                 ambiguous_count = session.execute(
-                    select(func.count(distinct(ResolutionDecisionModel.id))).where(
+                    select(func.count(distinct(ResolutionDecisionModel.observation_id))).where(
                         ResolutionDecisionModel.decision_type == "ambiguous_candidate",
                         ResolutionDecisionModel.event_id.in_(valid_event_ids),
                     )
@@ -260,7 +260,7 @@ class AnalyticsService:
             ).scalar() or 0
 
             ambiguous_count = session.execute(
-                select(func.count(distinct(ResolutionDecisionModel.id))).where(
+                select(func.count(distinct(ResolutionDecisionModel.observation_id))).where(
                     ResolutionDecisionModel.decision_type == "ambiguous_candidate"
                 )
             ).scalar() or 0

@@ -399,9 +399,14 @@ class DashboardService:
                     )
                 observations = obs_list
 
-                # Fetch resolution decisions
-                dec_stmt = select(ResolutionDecisionModel).where(
-                    ResolutionDecisionModel.event_id == event_id
+                # Fetch resolution decisions ordered by creation time descending (latest audit event first)
+                dec_stmt = (
+                    select(ResolutionDecisionModel)
+                    .where(ResolutionDecisionModel.event_id == event_id)
+                    .order_by(
+                        ResolutionDecisionModel.created_at.desc(),
+                        ResolutionDecisionModel.id.desc(),
+                    )
                 )
                 dec_models = session.execute(dec_stmt).scalars().all()
                 decisions = [

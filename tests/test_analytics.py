@@ -256,3 +256,135 @@ class TestAnalyticsService:
             assert summary.single_source_events == 0
             assert summary.multi_source_ratio == 0.0
             assert summary.events_by_type == {}
+
+    def test_analytics_metrics_stability_under_repeated_resolution_decisions(
+        self, analytics_service: AnalyticsService
+    ) -> None:
+        """Verify ambiguous_observations_count and merge_candidates_count remain stable across repeated runs."""
+        from beacon.resolution.models import DecisionType, FeatureScores, MergeCandidate, ResolutionOutcome
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        repo = StorageRepository()
+
+        ev = UnifiedDisasterEvent(
+            event_id="evt_stab_001",
+            event_type="flood",
+            location="Metro Bay",
+            start_time=datetime(2026, 5, 1, 10, 0, tzinfo=timezone.utc),
+            summary="Test event for stability.",
+            observation_ids=["obs_stab_001"],
+            source_ids=["src_stab"],
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        with Session(engine) as session:
+            repo.save_event(ev, session)
+
+            # Observation 1 has an ambiguous decision recorded in Run 1
+            outcome1 = ResolutionOutcome(
+                observation_id="obs_stab_001",
+                assigned_event_id="evt_stab_001",
+                decision=DecisionType.AMBIGUOUS_CANDIDATE,
+                score=0.65,
+                is_new_event=False,
+                rationale="Candidate in ambiguous range.",
+                feature_scores=FeatureScores(event_type_score=1.0, composite_score=0.65, missing_features=[]),
+            )
+            repo.save_resolution_decision(outcome1, session)
+
+            # In Run 2, the exact same observation is re-evaluated and produces another ambiguous decision
+            outcome2 = ResolutionOutcome(
+                observation_id="obs_stab_001",
+                assigned_event_id="evt_stab_001",
+                decision=DecisionType.AMBIGUOUS_CANDIDATE,
+                score=0.66,
+                is_new_event=False,
+                rationale="Re-evaluated candidate still in ambiguous range.",
+                feature_scores=FeatureScores(event_type_score=1.0, composite_score=0.66, missing_features=[]),
+            )
+            repo.save_resolution_decision(outcome2, session)
+
+            # Persist a merge candidate twice
+            mc = MergeCandidate(
+                primary_event_id="evt_stab_001",
+                secondary_event_id="evt_stab_002",
+                bridging_observation_id="obs_stab_001",
+                similarity_score=0.82,
+                rationale="Bridge detected.",
+            )
+            repo.save_merge_candidates([mc], session)
+            repo.save_merge_candidates([mc], session)
+            session.commit()
+
+            # Global unfiltered summary
+            summary = analytics_service.summarize_db(session)
+            # Must count 1 distinct ambiguous observation, NOT 2 audit decision rows
+            assert summary.ambiguous_observations_count == 1
+            # Merge candidate count must be 1, NOT 2
+            assert summary.merge_candidates_count == 1
+
+            # Filtered summary
+            flt = AnalyticsFilter(event_type="flood")
+            filtered_summary = analytics_service.summarize_db(session, filter_criteria=flt)
+            assert filtered_summary.ambiguous_observations_count == 1
+            assert filtered_summary.merge_candidates_count == 1
+
+    def test_dashboard_event_detail_decision_ordering(
+        self
+    ) -> None:
+        """Verify get_event_detail returns resolution decisions in chronological descending order."""
+        from sqlalchemy.orm import sessionmaker
+        from beacon.dashboard.services import DashboardService
+        from beacon.resolution.models import DecisionType, ResolutionOutcome
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        repo = StorageRepository()
+        factory = sessionmaker(bind=engine, expire_on_commit=False)
+
+        ev = UnifiedDisasterEvent(
+            event_id="evt_order_001",
+            event_type="flood",
+            location="Harbor Side",
+            start_time=datetime(2026, 5, 1, 10, 0, tzinfo=timezone.utc),
+            summary="Ordering test event.",
+            observation_ids=["obs_ord_001"],
+            source_ids=["src_ord"],
+            created_at=datetime.now(timezone.utc),
+            updated_at=datetime.now(timezone.utc),
+        )
+
+        with factory() as session:
+            repo.save_event(ev, session)
+            d1 = ResolutionOutcome(
+                observation_id="obs_ord_001",
+                assigned_event_id=ev.event_id,
+                decision=DecisionType.CONFIDENT_MATCH,
+                score=0.90,
+                is_new_event=False,
+                rationale="Initial match.",
+            )
+            repo.save_resolution_decision(d1, session)
+            session.commit()
+
+            d2 = ResolutionOutcome(
+                observation_id="obs_ord_001",
+                assigned_event_id=ev.event_id,
+                decision=DecisionType.IDEMPOTENT_RE_OBSERVATION,
+                score=0.92,
+                is_new_event=False,
+                rationale="Re-observation.",
+            )
+            repo.save_resolution_decision(d2, session)
+            session.commit()
+
+        service = DashboardService(session_factory=factory, repository=repo)
+        detail = service.get_event_detail(ev.event_id)
+        assert detail is not None
+        decisions = detail["decisions"]
+        assert len(decisions) == 2
+        # Latest audit event (idempotent_re_observation) must appear first
+        assert decisions[0]["decision_type"] == "idempotent_re_observation"
+        assert decisions[1]["decision_type"] == "confident_match"

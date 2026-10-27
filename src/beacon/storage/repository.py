@@ -326,19 +326,56 @@ class StorageRepository:
         merge_candidates: Sequence[MergeCandidate],
         session: Session,
     ) -> int:
-        """Record potential multi-event bridge / merge candidates."""
+        """Record potential multi-event bridge / merge candidates idempotently.
+
+        If a merge candidate already exists for the same event pair and bridging observation,
+        updates similarity score and rationale. If the candidate has already been reviewed
+        (status is not 'pending_review'), its reviewed status is preserved rather than regressed
+        back to 'pending_review'.
+        """
         saved = 0
         for mc in merge_candidates:
-            model = MergeCandidateModel(
-                primary_event_id=mc.primary_event_id,
-                secondary_event_id=mc.secondary_event_id,
-                bridging_observation_id=mc.bridging_observation_id,
-                similarity_score=mc.similarity_score,
-                rationale=mc.rationale,
-                status=mc.status,
-                created_at=datetime.now(timezone.utc),
+            stmt = select(MergeCandidateModel).where(
+                (
+                    (MergeCandidateModel.primary_event_id == mc.primary_event_id)
+                    & (MergeCandidateModel.secondary_event_id == mc.secondary_event_id)
+                )
+                | (
+                    (MergeCandidateModel.primary_event_id == mc.secondary_event_id)
+                    & (MergeCandidateModel.secondary_event_id == mc.primary_event_id)
+                )
             )
-            session.add(model)
+            if mc.bridging_observation_id is not None:
+                stmt = stmt.where(
+                    MergeCandidateModel.bridging_observation_id == mc.bridging_observation_id
+                )
+            else:
+                stmt = stmt.where(MergeCandidateModel.bridging_observation_id.is_(None))
+
+            existing = session.execute(stmt).scalar_one_or_none()
+
+            if existing:
+                existing.primary_event_id = mc.primary_event_id
+                existing.secondary_event_id = mc.secondary_event_id
+                existing.similarity_score = mc.similarity_score
+                existing.rationale = mc.rationale
+                # Preserve reviewer decision if already reviewed; only update status
+                # if existing is still pending or if caller explicitly passes non-pending
+                if existing.status == "pending_review":
+                    existing.status = mc.status
+                elif mc.status != "pending_review":
+                    existing.status = mc.status
+            else:
+                model = MergeCandidateModel(
+                    primary_event_id=mc.primary_event_id,
+                    secondary_event_id=mc.secondary_event_id,
+                    bridging_observation_id=mc.bridging_observation_id,
+                    similarity_score=mc.similarity_score,
+                    rationale=mc.rationale,
+                    status=mc.status,
+                    created_at=datetime.now(timezone.utc),
+                )
+                session.add(model)
             saved += 1
         return saved
 

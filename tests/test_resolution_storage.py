@@ -140,6 +140,144 @@ class TestStorageResolutionUnit:
         assert stored_merges[0].secondary_event_id == "evt_02"
         assert stored_merges[0].status == "pending_review"
 
+    def test_repeated_resolution_decisions_appends_legitimate_audit_history(
+        self, mem_session: Session
+    ) -> None:
+        """Verify repeated executions append legitimate resolution decision audit history."""
+        from sqlalchemy import select
+        from beacon.storage.schema import ResolutionDecisionModel
+
+        repo = StorageRepository()
+        obs_id = "obs_repeat_dec_001"
+        event_id = "evt_repeat_dec_001"
+
+        # 1. Initial resolution run: observation matched event
+        initial_outcome = ResolutionOutcome(
+            observation_id=obs_id,
+            assigned_event_id=event_id,
+            decision=DecisionType.CONFIDENT_MATCH,
+            score=0.91,
+            is_new_event=False,
+            rationale="Initial match above threshold.",
+            feature_scores=FeatureScores(
+                event_type_score=1.0,
+                composite_score=0.91,
+                missing_features=[],
+            ),
+        )
+        repo.save_resolution_decision(initial_outcome, mem_session)
+        mem_session.commit()
+
+        # 2. Subsequent pipeline run: observation recognized as idempotent re-observation
+        rerun_outcome = ResolutionOutcome(
+            observation_id=obs_id,
+            assigned_event_id=event_id,
+            decision=DecisionType.IDEMPOTENT_RE_OBSERVATION,
+            score=0.91,
+            is_new_event=False,
+            rationale="Idempotent re-observation verified against existing event.",
+            feature_scores=FeatureScores(
+                event_type_score=1.0,
+                composite_score=0.91,
+                missing_features=[],
+            ),
+        )
+        repo.save_resolution_decision(rerun_outcome, mem_session)
+        mem_session.commit()
+
+        # 3. Assert both decisions are retained as legitimate chronological audit history
+        decisions = mem_session.execute(
+            select(ResolutionDecisionModel)
+            .where(ResolutionDecisionModel.observation_id == obs_id)
+            .order_by(ResolutionDecisionModel.created_at.asc())
+        ).scalars().all()
+
+        assert len(decisions) == 2
+        assert decisions[0].decision_type == "confident_match"
+        assert decisions[1].decision_type == "idempotent_re_observation"
+        assert decisions[0].id != decisions[1].id
+
+    def test_repeated_merge_candidates_idempotent_and_status_preservation(
+        self, mem_session: Session
+    ) -> None:
+        """Verify merge candidates are updated idempotently without duplicates while preserving reviewer status."""
+        repo = StorageRepository()
+        mc1 = MergeCandidate(
+            primary_event_id="evt_alpha",
+            secondary_event_id="evt_beta",
+            bridging_observation_id="obs_bridge_01",
+            similarity_score=0.81,
+            rationale="Initial bridge detection.",
+            status="pending_review",
+        )
+
+        # 1. Initial save
+        repo.save_merge_candidates([mc1], mem_session)
+        mem_session.commit()
+
+        stored = repo.get_merge_candidates(mem_session)
+        assert len(stored) == 1
+        assert stored[0].primary_event_id == "evt_alpha"
+        assert stored[0].similarity_score == 0.81
+        assert stored[0].status == "pending_review"
+
+        # 2. Rerun with same candidate and updated score/rationale
+        mc1_updated = MergeCandidate(
+            primary_event_id="evt_alpha",
+            secondary_event_id="evt_beta",
+            bridging_observation_id="obs_bridge_01",
+            similarity_score=0.87,
+            rationale="Updated bridge evidence with higher score.",
+            status="pending_review",
+        )
+        repo.save_merge_candidates([mc1_updated], mem_session)
+        mem_session.commit()
+
+        stored2 = repo.get_merge_candidates(mem_session)
+        # Idempotent: no duplicate row created
+        assert len(stored2) == 1
+        assert stored2[0].similarity_score == 0.87
+        assert stored2[0].rationale == "Updated bridge evidence with higher score."
+        assert stored2[0].status == "pending_review"
+
+        # 3. Operator reviews candidate and updates status to 'reviewed'
+        from sqlalchemy import update
+        from beacon.storage.schema import MergeCandidateModel
+
+        mem_session.execute(
+            update(MergeCandidateModel)
+            .where(
+                MergeCandidateModel.primary_event_id == "evt_alpha",
+                MergeCandidateModel.secondary_event_id == "evt_beta",
+            )
+            .values(status="reviewed")
+        )
+        mem_session.commit()
+
+        # 4. Pipeline reruns again, generating candidate with default 'pending_review'
+        repo.save_merge_candidates([mc1_updated], mem_session)
+        mem_session.commit()
+
+        stored3 = repo.get_merge_candidates(mem_session)
+        assert len(stored3) == 1
+        # Reviewer's status must be preserved and NOT regressed to 'pending_review'
+        assert stored3[0].status == "reviewed"
+
+        # 5. Adding candidate with a different bridging observation creates a separate candidate
+        mc2 = MergeCandidate(
+            primary_event_id="evt_alpha",
+            secondary_event_id="evt_beta",
+            bridging_observation_id="obs_bridge_02",
+            similarity_score=0.79,
+            rationale="Independent bridge from second sensor.",
+            status="pending_review",
+        )
+        repo.save_merge_candidates([mc2], mem_session)
+        mem_session.commit()
+
+        stored4 = repo.get_merge_candidates(mem_session)
+        assert len(stored4) == 2
+
     def test_atomic_save_resolution_result(
         self, mem_session: Session, sample_event: UnifiedDisasterEvent
     ) -> None:
