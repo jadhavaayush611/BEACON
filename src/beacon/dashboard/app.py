@@ -43,9 +43,12 @@ db_status = service.test_database_connection()
 st.sidebar.title("🚨 BEACON System")
 st.sidebar.caption("v1.0.0 — Multi-Format Disaster Intelligence")
 
-if db_status["connected"]:
-    st.sidebar.success("🟢 PostgreSQL Connected")
+if db_status.get("schema_ready"):
+    st.sidebar.success("🟢 PostgreSQL Connected & Ready")
     st.sidebar.caption(f"Host: `{db_status['database_url_masked']}`")
+elif db_status.get("connected"):
+    st.sidebar.warning("🟡 PostgreSQL Connected (Uninitialized)")
+    st.sidebar.caption(db_status["message"])
 else:
     st.sidebar.warning("🟡 Storage: In-Memory / Unconnected")
     st.sidebar.caption(db_status["message"])
@@ -531,9 +534,17 @@ with tab_diagnostics:
 
     diag = service.test_database_connection()
 
-    if diag["connected"]:
+    if diag.get("schema_ready"):
         st.success(f"Database Status: {diag['status'].upper()}")
         st.write(f"Connected Endpoint: `{diag['database_url_masked']}`")
+
+        st.subheader("Relational Tables Row Counts")
+        t_data = [{"Table": k, "Row Count": v} for k, v in diag["tables"].items()]
+        st.table(t_data)
+    elif diag.get("connected"):
+        st.warning(f"Database Status: {diag['status'].upper()}")
+        st.write(f"Connected Endpoint: `{diag['database_url_masked']}`")
+        st.info(diag["message"])
 
         st.subheader("Relational Tables Row Counts")
         t_data = [{"Table": k, "Row Count": v} for k, v in diag["tables"].items()]

@@ -4,6 +4,7 @@ Validates overview aggregations, file uploads, pipeline integration,
 event querying, analytics, and database diagnostic services without requiring a browser.
 """
 
+from collections.abc import Generator
 from datetime import datetime, timezone
 from pathlib import Path
 import pytest
@@ -11,7 +12,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from beacon.analytics.models import AnalyticsFilter
-from beacon.config import Settings
+from beacon.config import Settings, get_settings
 from beacon.dashboard.formatters import (
     explain_compression_ratio,
     format_compression_ratio,
@@ -71,6 +72,21 @@ def dashboard_service(in_memory_factory: sessionmaker) -> DashboardService:
     """Initialize a DashboardService instance with an in-memory database."""
     settings = Settings(database_url="sqlite:///:memory:")
     return DashboardService(settings=settings, session_factory=in_memory_factory)
+
+
+@pytest.fixture
+def isolate_in_memory_dashboard(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
+    """Explicitly isolate environment and settings cache for in-memory dashboard execution."""
+    import streamlit as st
+
+    monkeypatch.setenv("BEACON_DATABASE_URL", "")
+    get_settings.cache_clear()
+    st.cache_resource.clear()
+    try:
+        yield
+    finally:
+        get_settings.cache_clear()
+        st.cache_resource.clear()
 
 
 @pytest.fixture
@@ -370,8 +386,10 @@ class TestDashboardService:
         """Non-existent event ID returns None."""
         assert dashboard_service.get_event_detail("non_existent_id") is None
 
-    def test_app_headless_smoke_runs_without_exception(self) -> None:
-        """Verify the Streamlit dashboard application launches and runs headlessly without error."""
+    def test_app_headless_smoke_runs_without_exception(
+        self, isolate_in_memory_dashboard: None
+    ) -> None:
+        """Verify the Streamlit dashboard application launches and runs headlessly without error in in-memory mode."""
         if not _can_create_socketpair():
             pytest.skip("Local loopback socket connection forbidden in sandboxed environment")
         from streamlit.testing.v1 import AppTest
@@ -380,6 +398,10 @@ class TestDashboardService:
         at = AppTest.from_file(str(app_path), default_timeout=15)
         at.run()
         assert not at.exception
+
+        # Verify in-memory storage indicator renders
+        storage_warns = [w.value for w in at.warning if "In-Memory" in w.value]
+        assert len(storage_warns) >= 1
 
     def test_get_event_detail_preserves_none_confidence_from_db(
         self, dashboard_service: DashboardService, sample_events: list[UnifiedDisasterEvent]
@@ -414,8 +436,10 @@ class TestDashboardService:
         matched_obs = next(o for o in detail["observations"] if o.observation_id == "obs_d_none")
         assert matched_obs.extraction_confidence is None
 
-    def test_app_headless_runs_complete_pipeline_without_exception(self) -> None:
-        """Verify dashboard runs complete sample pipeline and renders all views safely."""
+    def test_app_headless_runs_complete_pipeline_without_exception(
+        self, isolate_in_memory_dashboard: None
+    ) -> None:
+        """Verify dashboard runs complete sample pipeline and renders all views safely in in-memory mode."""
         if not _can_create_socketpair():
             pytest.skip("Local loopback socket connection forbidden in sandboxed environment")
         from streamlit.testing.v1 import AppTest
@@ -423,6 +447,14 @@ class TestDashboardService:
         app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
         at = AppTest.from_file(str(app_path), default_timeout=30)
         at.run()
+
+        # Verify in-memory storage indicator and disabled persistence checkbox
+        storage_warns = [w.value for w in at.warning if "In-Memory" in w.value]
+        assert len(storage_warns) >= 1
+        persist_cbs = [c for c in at.checkbox if "Persist results" in c.label]
+        assert len(persist_cbs) == 1
+        assert persist_cbs[0].value is False
+        assert persist_cbs[0].disabled is True
 
         run_btns = [b for b in at.button if "Run Complete Pipeline" in b.label]
         assert len(run_btns) == 1
@@ -468,8 +500,10 @@ class TestDashboardService:
         assert not at.exception
         assert at.session_state["last_pipeline_result"].execution_id == exec_id
 
-    def test_app_headless_failed_run_clears_prior_success_results(self) -> None:
-        """A failed pipeline execution clears prior success results so stale metrics are never displayed."""
+    def test_app_headless_failed_run_clears_prior_success_results(
+        self, isolate_in_memory_dashboard: None
+    ) -> None:
+        """A failed pipeline execution clears prior success results so stale metrics are never displayed in in-memory mode."""
         if not _can_create_socketpair():
             pytest.skip("Local loopback socket connection forbidden in sandboxed environment")
         from streamlit.testing.v1 import AppTest
@@ -477,6 +511,10 @@ class TestDashboardService:
         app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
         at = AppTest.from_file(str(app_path), default_timeout=30)
         at.run()
+
+        # Verify in-memory storage indicator and disabled persistence checkbox
+        storage_warns = [w.value for w in at.warning if "In-Memory" in w.value]
+        assert len(storage_warns) >= 1
 
         run_btns = [b for b in at.button if "Run Complete Pipeline" in b.label]
         assert len(run_btns) == 1
@@ -682,6 +720,80 @@ class TestDashboardService:
         )
         assert "Field Name" in df_conf.columns
         assert "Conflicting Claims" in df_conf.columns
+
+    def test_dashboard_service_reachable_uninitialized_database_behavior(self) -> None:
+        """Reachable database with uninitialized schema falls back safely to in-memory mode."""
+        engine = create_engine("sqlite:///:memory:")
+        factory = sessionmaker(bind=engine)
+        settings = Settings(database_url="sqlite:///:memory:")
+        service = DashboardService(settings=settings, session_factory=factory)
+
+        # Database is reachable but tables are not yet created
+        assert service.is_database_reachable is True
+        assert service.is_schema_ready is False
+        assert service.is_database_connected is False
+
+        # Diagnostic report correctly flags UNINITIALIZED status with actionable guidance
+        diag = service.test_database_connection()
+        assert diag["connected"] is True
+        assert diag["schema_ready"] is False
+        assert diag["status"] == "uninitialized"
+        assert "Run 'python scripts/init_db.py'" in diag["message"]
+
+        # All 7 tables report -1 (missing)
+        for t in [
+            "sources",
+            "observations",
+            "data_quality_results",
+            "events",
+            "event_observations",
+            "resolution_decisions",
+            "merge_candidates",
+        ]:
+            assert diag["tables"][t] == -1
+
+        # Overview and query calls gracefully fall back without raising ProgrammingError
+        overview = service.get_system_overview()
+        assert overview["is_live_db"] is False
+        assert overview["events_count"] == 0
+
+        events = service.query_events()
+        assert events == []
+
+    def test_app_headless_renders_with_uninitialized_database_without_exception(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """Dashboard renders headlessly when database is reachable but uninitialized."""
+        if not _can_create_socketpair():
+            pytest.skip("Local loopback socket connection forbidden in sandboxed environment")
+        import streamlit as st
+        from streamlit.testing.v1 import AppTest
+
+        db_file = tmp_path / "uninit_dashboard.db"
+        monkeypatch.setenv("BEACON_DATABASE_URL", f"sqlite:///{db_file.as_posix()}")
+        get_settings.cache_clear()
+        st.cache_resource.clear()
+
+        try:
+            app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
+            at = AppTest.from_file(str(app_path), default_timeout=15)
+            at.run()
+
+            # Renders cleanly with zero unhandled exceptions
+            assert len(at.exception) == 0
+
+            # Sidebar indicates uninitialized database warning
+            uninit_warns = [w.value for w in at.warning if "Uninitialized" in w.value]
+            assert len(uninit_warns) >= 1
+
+            # Persist checkbox is safely disabled
+            persist_cbs = [c for c in at.checkbox if "Persist results" in c.label]
+            assert len(persist_cbs) == 1
+            assert persist_cbs[0].value is False
+            assert persist_cbs[0].disabled is True
+        finally:
+            get_settings.cache_clear()
+            st.cache_resource.clear()
 
 
 class TestDashboardFormatters:

@@ -11,7 +11,7 @@ import shutil
 import tempfile
 from typing import Any, Optional, Sequence, Union
 
-from sqlalchemy import distinct, func, select, text
+from sqlalchemy import distinct, func, inspect, select, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from beacon.analytics.models import AnalyticsFilter, AnalyticsSummary
@@ -36,6 +36,16 @@ from beacon.storage import (
 )
 
 logger = logging.getLogger("beacon.dashboard.services")
+
+REQUIRED_TABLES: tuple[str, ...] = (
+    "sources",
+    "observations",
+    "data_quality_results",
+    "events",
+    "event_observations",
+    "resolution_decisions",
+    "merge_candidates",
+)
 
 
 class DashboardService:
@@ -67,8 +77,8 @@ class DashboardService:
         self._last_pipeline_result: Optional[ETLPipelineResult] = None
 
     @property
-    def is_database_connected(self) -> bool:
-        """Return True if a database session factory is available and operational."""
+    def is_database_reachable(self) -> bool:
+        """Return True if a database session factory is available and responds to a ping query."""
         if self.session_factory is None:
             return False
         try:
@@ -78,11 +88,35 @@ class DashboardService:
         except Exception:
             return False
 
+    @property
+    def is_schema_ready(self) -> bool:
+        """Return True if database is reachable and all required BEACON schema tables exist."""
+        if self.session_factory is None:
+            return False
+        try:
+            with get_session(self.session_factory) as session:
+                inspector = inspect(session.get_bind())
+                existing = set(inspector.get_table_names())
+                return set(REQUIRED_TABLES).issubset(existing)
+        except Exception as err:
+            logger.debug("Schema readiness check failed: %s", err)
+            return False
+
+    @property
+    def is_database_connected(self) -> bool:
+        """Return True if database is reachable and schema tables are ready for persistence.
+
+        Distinguishes server reachability (see `is_database_reachable`) from schema readiness
+        (see `is_schema_ready`). Prevents queries against uninitialized databases.
+        """
+        return self.is_schema_ready
+
     def test_database_connection(self) -> dict[str, Any]:
         """Test database connection and return detailed diagnostic status."""
         if not self.settings.database_url:
             return {
                 "connected": False,
+                "schema_ready": False,
                 "status": "unconfigured",
                 "message": "BEACON_DATABASE_URL is not set. Running in-memory mode.",
                 "database_url_masked": "None",
@@ -100,10 +134,14 @@ class DashboardService:
                 masked_url = f"{scheme}://{user}:****@{host_part}"
 
         try:
-            engine = create_db_engine(settings=self.settings)
-            factory = get_session_factory(engine)
+            factory = self.session_factory
+            if factory is None:
+                engine = create_db_engine(settings=self.settings)
+                factory = get_session_factory(engine)
             tables_count: dict[str, int] = {}
             with get_session(factory) as session:
+                inspector = inspect(session.get_bind())
+                existing_tables = set(inspector.get_table_names())
                 for model, name in [
                     (SourceModel, "sources"),
                     (ObservationModel, "observations"),
@@ -113,14 +151,32 @@ class DashboardService:
                     (ResolutionDecisionModel, "resolution_decisions"),
                     (MergeCandidateModel, "merge_candidates"),
                 ]:
-                    try:
-                        count = session.execute(select(func.count()).select_from(model)).scalar() or 0
-                        tables_count[name] = count
-                    except Exception:
+                    if name in existing_tables:
+                        try:
+                            count = session.execute(select(func.count()).select_from(model)).scalar() or 0
+                            tables_count[name] = count
+                        except Exception:
+                            tables_count[name] = -1
+                    else:
                         tables_count[name] = -1  # Table does not exist
+
+            missing = [name for name, count in tables_count.items() if count == -1]
+            if missing:
+                return {
+                    "connected": True,
+                    "schema_ready": False,
+                    "status": "uninitialized",
+                    "message": (
+                        f"Connected to database, but {len(missing)} required table(s) are missing: "
+                        f"{', '.join(missing)}. Run 'python scripts/init_db.py' to initialize the schema."
+                    ),
+                    "database_url_masked": masked_url,
+                    "tables": tables_count,
+                }
 
             return {
                 "connected": True,
+                "schema_ready": True,
                 "status": "healthy",
                 "message": "Connected to database successfully.",
                 "database_url_masked": masked_url,
@@ -129,6 +185,7 @@ class DashboardService:
         except Exception as err:
             return {
                 "connected": False,
+                "schema_ready": False,
                 "status": "error",
                 "message": f"Connection failed: {err}",
                 "database_url_masked": masked_url,
@@ -139,26 +196,32 @@ class DashboardService:
         """Collect aggregated overview metrics for the executive dashboard overview."""
         if self.is_database_connected:
             assert self.session_factory is not None
-            with get_session(self.session_factory) as session:
-                summary = self.analytics_service.summarize_db(session)
-                sources_count = session.execute(
-                    select(func.count(distinct(SourceModel.source_id)))
-                ).scalar() or 0
-                return {
-                    "sources_count": sources_count,
-                    "observations_count": summary.total_observations,
-                    "events_count": summary.total_events,
-                    "multi_source_events_count": summary.multi_source_events,
-                    "multi_source_ratio": summary.multi_source_ratio,
-                    "compression_ratio": summary.compression_ratio,
-                    "coverage_gaps": summary.coverage_gaps,
-                    "conflicting_claims_count": summary.conflicting_claims_count,
-                    "ambiguous_count": summary.ambiguous_observations_count,
-                    "merge_candidates_count": summary.merge_candidates_count,
-                    "events_by_type": summary.events_by_type,
-                    "events_by_severity": summary.events_by_severity,
-                    "is_live_db": True,
-                }
+            try:
+                with get_session(self.session_factory) as session:
+                    summary = self.analytics_service.summarize_db(session)
+                    sources_count = session.execute(
+                        select(func.count(distinct(SourceModel.source_id)))
+                    ).scalar() or 0
+                    return {
+                        "sources_count": sources_count,
+                        "observations_count": summary.total_observations,
+                        "events_count": summary.total_events,
+                        "multi_source_events_count": summary.multi_source_events,
+                        "multi_source_ratio": summary.multi_source_ratio,
+                        "compression_ratio": summary.compression_ratio,
+                        "coverage_gaps": summary.coverage_gaps,
+                        "conflicting_claims_count": summary.conflicting_claims_count,
+                        "ambiguous_count": summary.ambiguous_observations_count,
+                        "merge_candidates_count": summary.merge_candidates_count,
+                        "events_by_type": summary.events_by_type,
+                        "events_by_severity": summary.events_by_severity,
+                        "is_live_db": True,
+                    }
+            except Exception as err:
+                logger.warning(
+                    "Database query failed during overview aggregation; falling back to in-memory: %s",
+                    err,
+                )
 
         # Fallback to in-memory state if DB is not connected
         summary = self.analytics_service.summarize(
