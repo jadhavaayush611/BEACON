@@ -158,9 +158,9 @@ Copy-Item .env.example .env
 pytest -v
 ```
 
-All 216 unit and contract tests run completely locally without requiring external APIs, PostgreSQL, or OCR binaries.
+The 251 unit, contract, and dashboard tests run completely locally without requiring external APIs, PostgreSQL, or OCR binaries. The 6 PostgreSQL integration tests require a configured isolated test database and are skipped when `BEACON_TEST_DATABASE_URL` is unset.
 
-To run the complete test suite against a live PostgreSQL database:
+To run the complete 257-test suite against a live PostgreSQL database:
 ```powershell
 $env:BEACON_TEST_DATABASE_URL = "postgresql+psycopg://username:password@localhost:5432/beacon_test"
 $env:BEACON_REQUIRE_POSTGRES = "1"
