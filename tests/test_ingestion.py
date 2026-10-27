@@ -18,6 +18,20 @@ from beacon.ingestion import (
     ingest_file,
 )
 from beacon.models import ExtractionStatus, SourceType
+from beacon.pipeline.transform import ObservationTransformer
+from beacon.quality.validator import DataQualityValidator
+from beacon.resolution.resolver import EventResolver
+from beacon.storage.repository import StorageRepository
+from beacon.storage.schema import (
+    Base,
+    EventModel,
+    EventObservationModel,
+    ObservationModel,
+    ResolutionDecisionModel,
+    SourceModel,
+)
+from sqlalchemy import create_engine, select
+from sqlalchemy.orm import Session
 
 
 SAMPLE_DIR = Path("data/sample")
@@ -345,6 +359,25 @@ class TestTxtIngestion:
         assert res.status == ExtractionStatus.FAILED
         assert any("Invalid character encoding" in err for err in res.errors)
 
+    def test_txt_empty_and_whitespace_only(self, tmp_path: Path) -> None:
+        empty_file = tmp_path / "empty.txt"
+        empty_file.write_text("", encoding="utf-8")
+
+        res_empty = ingest_file(empty_file)
+        assert res_empty.status == ExtractionStatus.SUCCESS
+        assert res_empty.processed_count == 0
+        assert len(res_empty.observations) == 0
+        assert any("empty or whitespace-only" in w for w in res_empty.warnings)
+
+        ws_file = tmp_path / "whitespace.txt"
+        ws_file.write_text("   \n\t  \n  ", encoding="utf-8")
+
+        res_ws = ingest_file(ws_file)
+        assert res_ws.status == ExtractionStatus.SUCCESS
+        assert res_ws.processed_count == 0
+        assert len(res_ws.observations) == 0
+        assert any("empty or whitespace-only" in w for w in res_ws.warnings)
+
 
 # ==============================================================================
 # 5. PDF Ingestion Tests
@@ -471,6 +504,14 @@ class TestPdfIngestion:
         damaged_pdf.unlink()
         assert not damaged_pdf.exists()
 
+    def test_pdf_zero_byte_rejection(self, tmp_path: Path) -> None:
+        empty_pdf = tmp_path / "empty.pdf"
+        empty_pdf.write_bytes(b"")
+
+        res = ingest_file(empty_pdf)
+        assert res.status == ExtractionStatus.FAILED
+        assert any("Failed to open or parse PDF" in err for err in res.errors)
+
 
 # ==============================================================================
 # 6. Image Ingestion Tests
@@ -494,6 +535,14 @@ class TestImageIngestion:
         corrupt_img.write_bytes(b"\x89PNG\r\n\x1a\nNot a real PNG chunk sequence.")
 
         res = ingest_file(corrupt_img)
+        assert res.status == ExtractionStatus.FAILED
+        assert any("not a recognized or supported image format" in err or "Corrupt or unreadable" in err for err in res.errors)
+
+    def test_image_zero_byte_rejection(self, tmp_path: Path) -> None:
+        empty_img = tmp_path / "empty.png"
+        empty_img.write_bytes(b"")
+
+        res = ingest_file(empty_img)
         assert res.status == ExtractionStatus.FAILED
         assert any("not a recognized or supported image format" in err or "Corrupt or unreadable" in err for err in res.errors)
 
@@ -543,3 +592,112 @@ class TestProvenanceAndIntegrity:
             assert "token" not in k_lower
             assert "secret" not in k_lower
             assert "api_key" not in k_lower
+
+
+# ==============================================================================
+# 8. Full Format Traceability & Persistence Lineage
+# ==============================================================================
+
+class TestFullFormatTraceabilityAndLineage:
+    """Verifies all five formats through parsing, transformation, quality evaluation,
+
+    resolution, and database lineage persistence without synthetic fabrication.
+    """
+
+    def test_end_to_end_lineage_across_all_five_supported_formats(self) -> None:
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        repo = StorageRepository()
+        transformer = ObservationTransformer()
+        validator = DataQualityValidator()
+        resolver = EventResolver()
+
+        sample_files = [
+            SAMPLE_DIR / "events.json",
+            SAMPLE_DIR / "events.csv",
+            SAMPLE_DIR / "events.txt",
+            SAMPLE_DIR / "sample_report.pdf",
+            SAMPLE_DIR / "sample_disaster.png",
+        ]
+
+        ingestion_results = []
+        all_observations = []
+
+        with Session(engine) as session:
+            for file_path in sample_files:
+                res = ingest_file(file_path)
+                assert res.status == ExtractionStatus.SUCCESS
+                ingestion_results.append(res)
+
+                # Persist source record
+                repo.save_source(res.source_record, session)
+
+                if file_path.suffix == ".png":
+                    assert len(res.observations) == 0
+                    assert any("semantic disaster extraction deferred to OCR" in w for w in res.warnings)
+                else:
+                    assert len(res.observations) > 0
+                    transformed = transformer.transform_batch(res.observations)
+                    quality_report = validator.validate(transformed)
+
+                    repo.save_observations(transformed, session)
+                    repo.save_quality_results(quality_report.outcomes, session)
+                    all_observations.extend(transformed)
+
+            session.commit()
+
+            # Verify all 5 source records exist in storage
+            sources_in_db = session.execute(select(SourceModel)).scalars().all()
+            assert len(sources_in_db) == 5
+            source_types = {s.source_type for s in sources_in_db}
+            assert source_types == {"json", "csv", "txt", "pdf", "image"}
+
+            # Verify observations in DB link to valid sources
+            obs_in_db = session.execute(select(ObservationModel)).scalars().all()
+            assert len(obs_in_db) == len(all_observations)
+            for db_obs in obs_in_db:
+                assert db_obs.source_id in {s.source_id for s in sources_in_db}
+                assert db_obs.event_type is not None
+                assert db_obs.raw_claim is not None
+
+            # Resolve observations
+            res_result = resolver.resolve_observations(all_observations)
+            assert res_result.total_observations == len(all_observations)
+            assert len(res_result.resolved_events) >= 1
+
+            # Persist resolution result atomically
+            counts = repo.save_resolution_result(res_result, session)
+            session.commit()
+
+            assert counts["events_persisted"] == len(res_result.resolved_events)
+            assert counts["decisions_persisted"] == len(res_result.outcomes)
+
+            # Assert database lineage: Source -> Observation -> Event -> Decision
+            events_in_db = session.execute(select(EventModel)).scalars().all()
+            assert len(events_in_db) == len(res_result.resolved_events)
+
+            links_in_db = session.execute(select(EventObservationModel)).scalars().all()
+            assert len(links_in_db) == counts["links_persisted"]
+
+            decisions_in_db = session.execute(select(ResolutionDecisionModel)).scalars().all()
+            assert len(decisions_in_db) == len(res_result.outcomes)
+
+            # Ensure every link points to existing event and observation
+            event_ids = {e.event_id for e in events_in_db}
+            obs_ids = {o.observation_id for o in obs_in_db}
+            for link in links_in_db:
+                assert link.event_id in event_ids
+                assert link.observation_id in obs_ids
+
+            # Ensure every decision records valid observation and decision type
+            for decision in decisions_in_db:
+                assert decision.observation_id in obs_ids
+                assert decision.decision_type in {
+                    "confident_match",
+                    "no_match",
+                    "ambiguous_candidate",
+                    "idempotent_re_observation",
+                    "merge_candidate",
+                }
+                if decision.event_id is not None:
+                    assert decision.event_id in event_ids

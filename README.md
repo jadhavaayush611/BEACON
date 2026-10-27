@@ -12,9 +12,9 @@ BEACON delivers an end-to-end multi-format disaster intelligence engineering pip
 - **Heterogeneous Ingestion:** Structured JSON, sensor CSV, structured situation reports (TXT), multi-page PDF (`pypdf`), and raster image validation (`Pillow`).
 - **ETL & Data Quality Framework:** Normalized observation attributes, explicit data quality rule audits (`RuleSeverity.ERROR`, `WARNING`, `INFO`), and atomic error isolation.
 - **Explainable Event Resolution:** Multi-attribute candidate blocking (`CandidateGenerator`), spatiotemporal proximity scoring (`ObservationMatcher`), deterministic policy (`MatchPolicy`), and canonical profile synthesis (`EventProfileAggregator`) with preserved conflicting claims.
-- **Relational PostgreSQL Storage & Additive Migrations:** Seven relational tables with composite unique constraints, cascade rules, transaction safety, and pure additive idempotent migration scripts (`scripts/migrate_v0_4.py`).
+- **Relational PostgreSQL Storage & Additive Migrations:** Eight relational tables with composite unique constraints, cascade rules, transaction safety, and pure additive idempotent migration scripts (sources, observations, quality_results, events, event_observations, merge_candidates, resolution_decisions, pipeline_runs).
 - **Disaster Intelligence Analytics (`AnalyticsService`):** Compression ratios, multi-source validation percentages, coverage gaps, and conflict frequency.
-- **Interactive Streamlit Dashboard:** Complete dashboard (`src/beacon/dashboard/`) featuring Overview KPI cards, Multi-Format Ingestion upload, Pipeline Execution, Unified Event Explorer, Disaster Analytics, and Database Health diagnostics.
+- **Interactive Streamlit Dashboard:** Complete redesigned dashboard (`src/beacon/dashboard/`) featuring Live Overview with maps, Multi-Format Ingestion, Pipeline Execution with Run History and Retries, Unified Event Explorer, Resolution Lineage and Ambiguity Review, Disaster Analytics, and Database Health diagnostics.
 - **Continuous Integration (CI):** Fully automated GitHub Actions workflow verifying Python 3.10-3.12 with a live PostgreSQL 15 service container.
 
 ---
@@ -115,7 +115,10 @@ beacon/
 │   ├── test_resolver.py               # EventResolver orchestration & cross-source co-reference
 │   ├── test_analytics.py              # Disaster intelligence analytics tests
 │   ├── test_resolution_storage.py     # Event storage, linkage, and audit persistence tests
-│   └── test_migration_v0_4.py         # Phase 4 migration CLI and safety tests
+│   ├── test_migration_v0_4.py         # Phase 4 migration CLI and safety tests
+│   ├── test_dashboard.py              # Streamlit dashboard services and UI integration tests
+│   ├── test_data_operations.py        # Pipeline run records, safe retries, and batch operations tests
+│   └── test_end_to_end.py             # Full multi-format end-to-end integration and idempotency tests
 └── docs/
     ├── data_contract.md               # Canonical data contracts specification
     ├── ingestion.md                   # Ingestion & extraction architecture guide
@@ -158,9 +161,9 @@ Copy-Item .env.example .env
 pytest -v
 ```
 
-The 251 unit, contract, and dashboard tests run completely locally without requiring external APIs, PostgreSQL, or OCR binaries. The 6 PostgreSQL integration tests require a configured isolated test database and are skipped when `BEACON_TEST_DATABASE_URL` is unset.
+The 301 unit, contract, end-to-end, and dashboard tests run completely locally without requiring external APIs, PostgreSQL, or OCR binaries. The 6 PostgreSQL integration tests require a configured isolated test database and are skipped when `BEACON_TEST_DATABASE_URL` is unset to prevent modifying development or shared database instances.
 
-To run the complete 257-test suite against a live PostgreSQL database:
+To run the complete 305-test suite against a live PostgreSQL database:
 ```powershell
 $env:BEACON_TEST_DATABASE_URL = "postgresql+psycopg://username:password@localhost:5432/beacon_test"
 $env:BEACON_REQUIRE_POSTGRES = "1"
@@ -182,19 +185,24 @@ beacon-dashboard
 ```
 
 The dashboard opens at `http://localhost:8501` featuring:
-1. **Overview:** System KPIs, multi-source corroboration percentage, coverage gaps, and audit flags.
-2. **Ingestion:** Drag-and-drop file upload supporting JSON, CSV, TXT, PDF, and PNG/JPEG images.
-3. **Pipeline Execution:** Step-by-step ETL and Event Resolution execution over ingested files.
-4. **Unified Event Explorer:** Search and filter canonical disaster events by type, severity, location, and drill down into constituent observations and conflicting claims.
-5. **Disaster Analytics:** Real-time charts for disaster distributions, conflict frequency, and compression ratios.
-6. **Database & Diagnostics:** Relational table row counts, connection status, and configuration inspection.
+1. **Live Overview:** Real-time system KPIs, interactive geospatial disaster map, recent event feed, and data coverage indicators.
+2. **Event Explorer:** Faceted search and filters (type, severity, location, dates, min sources), canonical disaster event profiles, constituent observations with source lineage, and conflicting claims.
+3. **Pipeline Execution:** In-memory or database-backed batch processing, execution duration, Pipeline Run History audit trail, and safe execution retries with `failed_inputs_only` filtering.
+4. **Resolution & Lineage:** Ambiguous observation review with manual event assignment, and merge candidate bridge detection.
+5. **Analytics & Quality:** Multi-source validation ratios, compression statistics, conflict frequency distributions, and Data Quality rule evaluation audits.
+6. **Database & Diagnostics:** Relational schema readiness checks (all 8 tables), table row counts, connection status, and configuration inspection.
+
+
+
+
+
 
 ---
 
 ## Database Initialization & Migration
 
 ```powershell
-# 1. Fresh Database Initialization (Initializes all 7 tables)
+# 1. Fresh Database Initialization (Initializes all 8 tables)
 python scripts/init_db.py --url postgresql+psycopg://username:password@localhost:5432/beacon
 
 # 2. Additive Migration from Phase 3 to Phase 4 / v1.0
@@ -210,13 +218,58 @@ For detailed migration, isolation, and rollback guidance, see [docs/database_mig
 
 ## Known System Boundaries & Explicit Limitations
 
-> [!WARNING]
-> **Image Extraction Boundary:**
-> The image ingestor validates file integrity, dimensions, and image format metadata using Pillow. It explicitly **does not perform Optical Character Recognition (OCR)** or machine-vision feature extraction.
+> [!NOTE]
 
-> [!WARNING]
+> **Supported Formats & OCR Limitations:**
+> BEACON natively ingests JSON telemetry streams, CSV sensor logs, structured TXT dispatches, multi-page PDF documents (`pypdf`), and raster imagery (`Pillow`). For raster imagery, image dimensions and format integrity are verified; OCR via `pytesseract` is evaluated only if optional OCR binary dependencies are installed, otherwise OCR is gracefully deferred/skipped without fabricating data.
+
+> [!NOTE]
+> **Resolution Thresholds & Ambiguity Management:**
+> - **Match Threshold ($\ge 0.75$):** Automatically links observations into a unified canonical event profile.
+> - **Candidate Threshold ($0.45 \le \text{score} < 0.75$):** Flags observations as ambiguous, persisting an immutable `ResolutionDecisionModel(decision_type="ambiguous")` and leaving the observation unassigned to prevent spurious merges. Ambiguous observations can be audited and manually assigned in Tab 4 ("Resolution & Lineage") without rewriting history.
+> - **New Event ($\text{score} < 0.45$):** Creates a distinct canonical disaster event profile.
+> - **Conflict Preservation:** Conflicting field values across corroborating sources (e.g. conflicting severities or timestamps) are preserved in `conflicting_claims` rather than overwritten.
+
+> [!NOTE]
+> **Pipeline Run History, Safe Retries & Idempotency:**
+> - Every pipeline execution receives a unique stable identifier (`run_...` or `retry_...`) capturing UTC timestamps, duration, status, and input summaries.
+> - Passwords, tokens, API keys, and connection strings are automatically redacted from error traces and run records.
+> - Retries establish parent-child execution lineage (`retry_of_run_id`). Reprocessing identical inputs preserves strict entity idempotency (no duplicate sources, observations, events, or merge candidates), while append-only resolution decisions maintain full auditability.
+> - Filtering by `failed_inputs_only` leverages structured per-input execution records (`InputFileExecutionRecord`) and stable identifiers, avoiding fragile error text parsing.
+> - Recurring/cron scheduling is deferred in MVP v1.0.0.
+
+> [!NOTE]
+
 > **Antimeridian Bounding-Box Boundary:**
 > The synthesized event bounding box computes standard Cartesian planar extrema (`min` and `max` longitude). It is not antimeridian-aware across the $\pm 180^\circ$ International Date Line. Individual constituent observation coordinates remain intact for spherical GIS calculations.
+
+---
+
+## Fresh Developer Walkthrough & Demo Steps
+
+A fresh developer can clone the repository, run tests, and explore the complete application without configuring external databases or Docker containers:
+
+### 1. Setup and Verify Tests
+```powershell
+# Activate virtual environment and run the test suite (301 passed, 6 live PostgreSQL-only tests safely skipped)
+.\.venv\Scripts\Activate.ps1
+pytest -rs tests
+```
+
+### 2. Launch the Web Dashboard
+```powershell
+# In-memory SQLite is used automatically when no PostgreSQL database URL is configured
+streamlit run src/beacon/dashboard/app.py
+```
+
+### 3. End-to-End Demo Workflow
+1. **Pipeline Execution (Tab 3):** Click **"⚡ Run Complete Pipeline"** to process the 5 heterogeneous sample files in `data/sample/`. Inspect real-time execution duration and the new entry in the **"Pipeline Run History & Audit Trail"** table.
+2. **Safe Execution Retries (Tab 3):** Under **"🔄 Safe Execution Retries"**, select the executed run ID, choose **"Full execution retry"** or **"Retry failed inputs only"**, and click **"Retry Run"**. Note that entity records do not duplicate, while run history maintains parent-child lineage.
+3. **Live Overview (Tab 1):** View overall system metrics, disaster distribution by severity, and interactive geospatial mapping of disaster events.
+4. **Event Explorer (Tab 2):** Filter events by type (e.g., `flood`) or severity (e.g., `severe`). Drill down into canonical profiles, constituent observations with source references, and preserved conflicting claims.
+5. **Resolution & Lineage (Tab 4):** Inspect candidate pairs and review unassigned ambiguous observations with their exact feature similarity scores.
+6. **Analytics & Quality (Tab 5):** Review compression ratios, multi-source corroboration metrics, and data quality rule evaluation charts.
+7. **Database Health (Tab 6):** Verify connection status and schema readiness checks across all 8 relational tables.
 
 ---
 

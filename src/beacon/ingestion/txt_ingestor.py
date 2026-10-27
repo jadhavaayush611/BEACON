@@ -104,6 +104,7 @@ class TxtIngestor(BaseIngestor):
         if not blocks:
             if not content.strip():
                 status = ExtractionStatus.SUCCESS
+                warnings.append(f"TXT file '{path.name}' is empty or whitespace-only.")
             else:
                 status = ExtractionStatus.SUCCESS
                 warnings.append(

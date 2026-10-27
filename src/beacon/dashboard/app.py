@@ -388,6 +388,72 @@ with tab_pipeline:
             ]
             st.dataframe(findings_data, width="stretch")
 
+    # Section: Run History & Safe Retries
+    st.markdown("---")
+    st.subheader("📜 Pipeline Run History & Audit Trail")
+    recent_runs = service.list_pipeline_runs(limit=10)
+
+    if not recent_runs:
+        st.info(
+            "ℹ️ No pipeline execution records found yet. "
+            "Trigger the pipeline above to record execution metrics, file statuses, and audit lineage."
+        )
+    else:
+        run_rows = []
+        for r in recent_runs:
+            inputs_meta = r.inputs_summary or {}
+            counts_meta = r.counts_summary or {}
+            files_str = f"{inputs_meta.get('succeeded', 0)}/{inputs_meta.get('total_inputs', 0)} ok"
+            if inputs_meta.get("failed", 0) > 0:
+                files_str += f" ({inputs_meta.get('failed')} failed)"
+            dur_str = f"{r.duration_seconds:.2f}s" if r.duration_seconds is not None else "—"
+            run_rows.append({
+                "Run ID": r.run_id,
+                "Status": r.status.value.upper(),
+                "Trigger": r.trigger_type.upper(),
+                "Retry Of": r.retry_of_run_id or "—",
+                "Started (UTC)": format_timestamp(r.started_at),
+                "Duration": dur_str,
+                "Inputs": files_str,
+                "Extracted": counts_meta.get("observations_extracted", 0),
+                "Accepted": counts_meta.get("observations_accepted", 0),
+                "Events": counts_meta.get("events_synthesized", 0),
+                "Failures": len(r.failure_details),
+            })
+        st.dataframe(run_rows, width="stretch")
+
+        # Retry controls for failed or partial runs
+        failed_or_partial_runs = [
+            r for r in recent_runs if r.status.value in ("failed", "partial")
+        ]
+        if failed_or_partial_runs:
+            st.markdown("##### 🔄 Safe Execution Retries")
+            col_r1, col_r2, col_r3 = st.columns([2, 1, 1])
+            with col_r1:
+                selected_retry_id = st.selectbox(
+                    "Select execution run to retry:",
+                    options=[r.run_id for r in failed_or_partial_runs],
+                    key="select_retry_run_id",
+                )
+            with col_r2:
+                failed_only = st.checkbox("Retry failed inputs only", value=True, key="retry_failed_only")
+            with col_r3:
+                if st.button("🔁 Trigger Retry Run", type="secondary", key="btn_trigger_retry"):
+                    with st.spinner(f"Retrying run '{selected_retry_id}'..."):
+                        retry_res = service.retry_pipeline_run(
+                            selected_retry_id,
+                            failed_inputs_only=failed_only,
+                            persist_db=persist_option,
+                        )
+                        st.session_state["last_pipeline_result"] = retry_res
+                        st.session_state["last_pipeline_error"] = None
+                        st.rerun()
+
+    st.caption(
+        "🕒 **Automated Scheduling Status:** Recurring daemon/cron execution is deferred in BEACON v1.0.0 MVP. "
+        "Batch orchestration operates via explicit deterministic execution triggers with full audit history."
+    )
+
 # ==============================================================================
 # TAB 4: UNIFIED EVENT EXPLORER
 # ==============================================================================

@@ -294,3 +294,30 @@ class MergeCandidateModel(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class PipelineRunModel(Base):
+    """Stores execution history, batch telemetry, and retry tracking for pipeline runs."""
+
+    __tablename__ = "pipeline_runs"
+
+    run_id = Column(String(64), primary_key=True)
+    status = Column(String(32), nullable=False, index=True)
+    started_at = Column(DateTime(timezone=True), nullable=False, index=True)
+    completed_at = Column(DateTime(timezone=True), nullable=True)
+    duration_seconds = Column(Float, nullable=True)
+    trigger_type = Column(String(32), nullable=False, default="manual")
+    retry_of_run_id = Column(
+        String(64),
+        ForeignKey("pipeline_runs.run_id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    inputs_summary = Column(JSON, nullable=False, default=dict)
+    counts_summary = Column(JSON, nullable=False, default=dict)
+    failure_details = Column(JSON, nullable=False, default=list)
+    created_at = Column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )

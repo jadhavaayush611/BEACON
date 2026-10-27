@@ -107,3 +107,15 @@ def setup_logging(settings: Optional[Settings] = None) -> logging.Logger:
         logger.addHandler(handler)
 
     return logger
+
+
+def redact_sensitive_text(text: str) -> str:
+    """Scrub sensitive credentials, passwords, tokens, and database URLs from text."""
+    flt = SensitiveDataFilter()
+    return flt._redact_string(text)
+
+
+def redact_sensitive_dict(data: dict[str, Any]) -> dict[str, Any]:
+    """Recursively scrub sensitive keys and credential values from dictionaries."""
+    flt = SensitiveDataFilter()
+    return flt._redact_dict(data)

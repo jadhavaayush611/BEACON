@@ -16,6 +16,7 @@ from beacon.models import (
     SourceType,
     UnifiedDisasterEvent,
 )
+from beacon.pipeline.result import InputFileExecutionRecord, PipelineRunRecord, RunStatus
 from beacon.quality.models import ValidationOutcome
 from beacon.resolution.models import (
     MergeCandidate,
@@ -27,10 +28,12 @@ from beacon.storage.schema import (
     EventObservationModel,
     MergeCandidateModel,
     ObservationModel,
+    PipelineRunModel,
     QualityResultModel,
     ResolutionDecisionModel,
     SourceModel,
 )
+from beacon.logging_config import redact_sensitive_dict, redact_sensitive_text
 
 logger = logging.getLogger("beacon.storage.repository")
 
@@ -667,4 +670,129 @@ class StorageRepository:
                 "decision": dec_data,
             })
 
+        return results
+
+    def save_pipeline_run(
+        self,
+        run_record: PipelineRunRecord,
+        session: Session,
+    ) -> PipelineRunModel:
+        """Persist or update a pipeline run execution record with sanitized diagnostics."""
+        existing = session.execute(
+            select(PipelineRunModel).where(PipelineRunModel.run_id == run_record.run_id)
+        ).scalar_one_or_none()
+
+        sanitized_inputs = redact_sensitive_dict(run_record.inputs_summary)
+        sanitized_counts = redact_sensitive_dict(run_record.counts_summary)
+        sanitized_failures = [redact_sensitive_text(f) for f in run_record.failure_details]
+
+        if existing:
+            existing.status = run_record.status.value
+            existing.completed_at = run_record.completed_at
+            existing.duration_seconds = run_record.duration_seconds
+            existing.inputs_summary = sanitized_inputs
+            existing.counts_summary = sanitized_counts
+            existing.failure_details = sanitized_failures
+            return existing
+
+        model = PipelineRunModel(
+            run_id=run_record.run_id,
+            status=run_record.status.value,
+            started_at=run_record.started_at,
+            completed_at=run_record.completed_at,
+            duration_seconds=run_record.duration_seconds,
+            trigger_type=run_record.trigger_type,
+            retry_of_run_id=run_record.retry_of_run_id,
+            inputs_summary=sanitized_inputs,
+            counts_summary=sanitized_counts,
+            failure_details=sanitized_failures,
+            created_at=run_record.created_at or datetime.now(timezone.utc),
+        )
+        session.add(model)
+        return model
+
+    def get_pipeline_run(
+        self,
+        run_id: str,
+        session: Session,
+    ) -> Optional[PipelineRunRecord]:
+        """Fetch a pipeline run execution record by identifier."""
+        model = session.execute(
+            select(PipelineRunModel).where(PipelineRunModel.run_id == run_id)
+        ).scalar_one_or_none()
+        if not model:
+            return None
+
+        try:
+            status_enum = RunStatus(model.status)
+        except ValueError:
+            status_enum = RunStatus.FAILED if model.failure_details else RunStatus.COMPLETED
+
+        inputs_dict = dict(model.inputs_summary or {})
+        input_files_list: list[InputFileExecutionRecord] = []
+        for ifr in inputs_dict.get("files", []):
+            if isinstance(ifr, dict):
+                try:
+                    input_files_list.append(InputFileExecutionRecord(**ifr))
+                except Exception:
+                    pass
+
+        return PipelineRunRecord(
+            run_id=model.run_id,
+            status=status_enum,
+            started_at=_ensure_utc(model.started_at),
+            completed_at=_ensure_utc(model.completed_at),
+            duration_seconds=model.duration_seconds,
+            trigger_type=model.trigger_type or "manual",
+            retry_of_run_id=model.retry_of_run_id,
+            input_files=input_files_list,
+            inputs_summary=inputs_dict,
+            counts_summary=dict(model.counts_summary or {}),
+            failure_details=list(model.failure_details or []),
+            created_at=_ensure_utc(model.created_at),
+        )
+
+    def list_pipeline_runs(
+        self,
+        session: Session,
+        limit: Optional[int] = 50,
+    ) -> list[PipelineRunRecord]:
+        """List recent pipeline run execution records ordered newest first."""
+        stmt = select(PipelineRunModel).order_by(PipelineRunModel.started_at.desc())
+        if limit is not None:
+            stmt = stmt.limit(limit)
+
+        models = session.execute(stmt).scalars().all()
+        results: list[PipelineRunRecord] = []
+        for m in models:
+            try:
+                st = RunStatus(m.status)
+            except ValueError:
+                st = RunStatus.FAILED if m.failure_details else RunStatus.COMPLETED
+
+            inputs_dict = dict(m.inputs_summary or {})
+            input_files_list: list[InputFileExecutionRecord] = []
+            for ifr in inputs_dict.get("files", []):
+                if isinstance(ifr, dict):
+                    try:
+                        input_files_list.append(InputFileExecutionRecord(**ifr))
+                    except Exception:
+                        pass
+
+            results.append(
+                PipelineRunRecord(
+                    run_id=m.run_id,
+                    status=st,
+                    started_at=_ensure_utc(m.started_at),
+                    completed_at=_ensure_utc(m.completed_at),
+                    duration_seconds=m.duration_seconds,
+                    trigger_type=m.trigger_type or "manual",
+                    retry_of_run_id=m.retry_of_run_id,
+                    input_files=input_files_list,
+                    inputs_summary=inputs_dict,
+                    counts_summary=dict(m.counts_summary or {}),
+                    failure_details=list(m.failure_details or []),
+                    created_at=_ensure_utc(m.created_at),
+                )
+            )
         return results

@@ -646,6 +646,40 @@ class TestDashboardService:
         assert len([s.value for s in at.success if "Complete!" in s.value]) == 0
         assert any("Simulated ETL extraction failure" in e.value for e in at.error)
 
+    def test_app_headless_renders_pipeline_run_history(
+        self, isolate_in_memory_dashboard: None
+    ) -> None:
+        """Dashboard renders execution history table and scheduling notice."""
+        if not _can_create_socketpair():
+            pytest.skip("Local loopback socket connection forbidden in sandboxed environment")
+        from streamlit.testing.v1 import AppTest
+
+        app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
+        at = AppTest.from_file(str(app_path), default_timeout=30)
+        at.run()
+
+        # Before run: empty state notice rendered
+        empty_infos = [i.value for i in at.info if "No pipeline execution records found yet" in i.value]
+        assert len(empty_infos) >= 1
+
+        # Scheduling notice rendered
+        sched_caps = [c.value for c in at.caption if "Automated Scheduling Status" in c.value]
+        assert len(sched_caps) >= 1
+
+        # Trigger run
+        run_btns = [b for b in at.button if "Run Complete Pipeline" in b.label]
+        assert len(run_btns) == 1
+        run_btns[0].click().run()
+
+        # After run: run history dataframe renders with Run ID column
+        run_history_found = False
+        for df in at.dataframe:
+            if "Run ID" in df.value.columns and "Status" in df.value.columns:
+                run_history_found = True
+                assert len(df.value) >= 1
+                assert df.value["Status"].iloc[0] == "COMPLETED"
+        assert run_history_found, "Expected pipeline run history dataframe rendered in dashboard"
+
 
     def test_overview_refreshes_immediately_after_pipeline_execution(self) -> None:
         """Overview metrics update immediately upon pipeline execution from zero to resolved counts."""

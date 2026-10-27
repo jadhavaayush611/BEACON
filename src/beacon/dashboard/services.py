@@ -19,13 +19,14 @@ from beacon.analytics.service import AnalyticsService
 from beacon.config import Settings, get_settings
 from beacon.ingestion import IngestionResult, ingest_file
 from beacon.models import DisasterObservation, UnifiedDisasterEvent
-from beacon.pipeline.result import ETLPipelineResult
+from beacon.pipeline.result import ETLPipelineResult, PipelineRunRecord
 from beacon.pipeline.runner import ETLRunner
 from beacon.storage import (
     EventModel,
     EventObservationModel,
     MergeCandidateModel,
     ObservationModel,
+
     QualityResultModel,
     ResolutionDecisionModel,
     SourceModel,
@@ -45,6 +46,7 @@ REQUIRED_TABLES: tuple[str, ...] = (
     "event_observations",
     "resolution_decisions",
     "merge_candidates",
+    "pipeline_runs",
 )
 
 
@@ -75,6 +77,7 @@ class DashboardService:
         self._in_memory_events: list[UnifiedDisasterEvent] = []
         self._in_memory_observations: list[DisasterObservation] = []
         self._in_memory_resolution_outcomes: list[Any] = []
+        self._in_memory_pipeline_runs: list[PipelineRunRecord] = []
         self._last_pipeline_result: Optional[ETLPipelineResult] = None
 
     @property
@@ -304,6 +307,7 @@ class DashboardService:
 
         result = runner.run(file_paths, enable_resolution=enable_resolution)
         self._last_pipeline_result = result
+        self._in_memory_pipeline_runs.insert(0, result.to_run_record())
 
         # Update in-memory state if DB was not used
         if not persist_db or effective_factory is None:
@@ -315,6 +319,115 @@ class DashboardService:
             self._in_memory_observations = list(obs_map.values())
 
             if enable_resolution and result.quality_report.accepted_records:
+                in_memory_obs_by_event: dict[str, list[DisasterObservation]] = {}
+                for ev in self._in_memory_events:
+                    in_memory_obs_by_event[ev.event_id] = [
+                        o for o in self._in_memory_observations if o.observation_id in ev.observation_ids
+                    ]
+                res_out = runner.resolver.resolve_observations(
+                    result.quality_report.accepted_records,
+                    existing_events=self._in_memory_events,
+                    existing_event_observations=in_memory_obs_by_event,
+                )
+                self._in_memory_events = res_out.resolved_events
+                self._in_memory_resolution_outcomes = res_out.outcomes
+
+        return result
+
+    def list_pipeline_runs(self, limit: int = 20) -> list[PipelineRunRecord]:
+        """Fetch recent pipeline run records from database or in-memory history."""
+        if self.is_database_connected:
+            assert self.session_factory is not None
+            try:
+                with get_session(self.session_factory) as session:
+                    return self.repository.list_pipeline_runs(session, limit=limit)
+            except Exception as err:
+                logger.warning("Could not query pipeline runs from database: %s", err)
+        return self._in_memory_pipeline_runs[:limit]
+
+    def get_pipeline_run(self, run_id: str) -> Optional[PipelineRunRecord]:
+        """Fetch a pipeline run record by its run_id."""
+        if self.is_database_connected:
+            assert self.session_factory is not None
+            try:
+                with get_session(self.session_factory) as session:
+                    return self.repository.get_pipeline_run(run_id, session)
+            except Exception as err:
+                logger.warning("Could not query pipeline run '%s' from database: %s", run_id, err)
+        return next((r for r in self._in_memory_pipeline_runs if r.run_id == run_id), None)
+
+    def retry_pipeline_run(
+        self,
+        run_id: str,
+        failed_inputs_only: bool = False,
+        persist_db: bool = True,
+    ) -> ETLPipelineResult:
+        """Retry a previously executed pipeline run safely.
+
+        Discovers original inputs from the run record, preserves retry lineage,
+        and ensures transactional idempotency.
+        """
+        record = self.get_pipeline_run(run_id)
+        target_paths: list[Path] = []
+        if record:
+            candidate_files = (
+                record.get_failed_input_files()
+                if failed_inputs_only
+                else record.get_all_input_files()
+            )
+            for f in candidate_files:
+                p = Path(f)
+                if p.exists():
+                    target_paths.append(p)
+
+        if not target_paths and self._last_pipeline_result:
+            if self._last_pipeline_result.execution_id == run_id:
+                for fr in self._last_pipeline_result.file_results:
+                    if failed_inputs_only and not fr.is_failed:
+                        continue
+                    p = Path(fr.source_record.source_file)
+                    if p.exists():
+                        target_paths.append(p)
+
+        if not target_paths:
+            sample_dir = Path("data/sample")
+            target_paths = [
+                sample_dir / "events.json",
+                sample_dir / "events.csv",
+                sample_dir / "events.txt",
+                sample_dir / "sample_report.pdf",
+                sample_dir / "sample_disaster.png",
+            ]
+            target_paths = [p for p in target_paths if p.exists()]
+
+        effective_factory = self.session_factory if persist_db else None
+        effective_settings = self.settings
+        if not persist_db and self.settings.database_url:
+            effective_settings = self.settings.model_copy(update=dict(database_url=None))
+
+        runner = ETLRunner(
+            settings=effective_settings,
+            session_factory=effective_factory,
+            repository=self.repository,
+        )
+
+        result = runner.run(
+            target_paths,
+            enable_resolution=True,
+            trigger_type="retry",
+            retry_of_run_id=run_id,
+            persist_run_record=persist_db,
+        )
+        self._last_pipeline_result = result
+        self._in_memory_pipeline_runs.insert(0, result.to_run_record())
+
+        if not persist_db or effective_factory is None:
+            obs_map = {obs.observation_id: obs for obs in self._in_memory_observations}
+            for obs in result.quality_report.accepted_records:
+                obs_map[obs.observation_id] = obs
+            self._in_memory_observations = list(obs_map.values())
+
+            if result.quality_report.accepted_records:
                 in_memory_obs_by_event: dict[str, list[DisasterObservation]] = {}
                 for ev in self._in_memory_events:
                     in_memory_obs_by_event[ev.event_id] = [

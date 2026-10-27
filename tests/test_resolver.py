@@ -1,6 +1,6 @@
 """Unit and end-to-end integration tests for EventResolver orchestrator."""
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import pytest
 
@@ -8,7 +8,8 @@ from beacon.config import Settings
 from beacon.ingestion import ingest_file
 from beacon.models import DisasterObservation, UnifiedDisasterEvent
 from beacon.pipeline.transform import ObservationTransformer
-from beacon.resolution.models import DecisionType
+from beacon.resolution.models import CandidateMatch, DecisionType, FeatureScores
+from beacon.resolution.policy import MatchPolicy
 from beacon.resolution.resolver import AmbiguousObservationAssociationError
 from beacon.resolution.resolver import EventResolver
 
@@ -488,3 +489,176 @@ class TestEventResolver:
         assert outcomes["obs_unanc_01"].decision == DecisionType.IDEMPOTENT_RE_OBSERVATION
         assert outcomes["obs_unanc_01"].score <= 0.40  # Must NEVER be fabricated as 1.0!
         assert "0.400" in outcomes["obs_unanc_01"].rationale
+
+    def test_near_tie_ambiguity_candidate(self) -> None:
+        """Verify that two candidate matches within tie_margin (0.08) yield AMBIGUOUS_CANDIDATE."""
+        policy = MatchPolicy(tie_margin=0.08)
+        obs = DisasterObservation(
+            observation_id="obs_tie",
+            source_id="src_tie",
+            event_type="flood",
+            location="Riverside",
+            event_time=datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc),
+        )
+        scores1 = FeatureScores(
+            event_type_score=1.0,
+            spatial_score=0.7,
+            temporal_score=0.7,
+            location_text_score=0.6,
+            composite_score=0.68,
+        )
+        scores2 = FeatureScores(
+            event_type_score=1.0,
+            spatial_score=0.65,
+            temporal_score=0.65,
+            location_text_score=0.6,
+            composite_score=0.64,
+        )
+        cand1 = CandidateMatch(
+            observation_id="obs_tie",
+            candidate_event_id="evt_01",
+            decision=DecisionType.AMBIGUOUS_CANDIDATE,
+            score=0.68,
+            feature_scores=scores1,
+            rationale="Candidate 1 score",
+        )
+        cand2 = CandidateMatch(
+            observation_id="obs_tie",
+            candidate_event_id="evt_02",
+            decision=DecisionType.AMBIGUOUS_CANDIDATE,
+            score=0.64,  # diff is 0.04 < tie_margin (0.08)
+            feature_scores=scores2,
+            rationale="Candidate 2 score",
+        )
+
+        outcome, merges = policy.evaluate_candidates(obs, [cand1, cand2])
+        assert outcome.decision == DecisionType.AMBIGUOUS_CANDIDATE
+        assert outcome.assigned_event_id is None
+        assert "Near-tie ambiguous candidate" in outcome.rationale
+        assert len(merges) == 0
+
+    def test_assign_ambiguous_flag_behavior(self) -> None:
+        """Verify behavior when assign_ambiguous is False vs True."""
+        t0 = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+        existing_event = UnifiedDisasterEvent(
+            event_id="evt_ambig_target",
+            event_type="flood",
+            location="Bayview District",
+            start_time=t0,
+            summary="Existing Flood",
+            observation_ids=["obs_base"],
+            source_ids=["src_base"],
+            metadata={"centroid": {"latitude": 37.77, "longitude": -122.42}},
+            created_at=t0,
+            updated_at=t0,
+        )
+        ambig_obs = DisasterObservation(
+            observation_id="obs_ambig_test",
+            source_id="src_test",
+            event_type="flood",
+            location="Bayview Outskirts",
+            latitude=38.00,
+            longitude=-122.10,
+            event_time=t0 + timedelta(hours=30),
+        )
+
+        # 1. assign_ambiguous = False
+        res_default = EventResolver(policy=MatchPolicy(assign_ambiguous=False))
+        out_default = res_default.resolve_observations([ambig_obs], existing_events=[existing_event])
+        assert out_default.ambiguous_count == 1
+        assert out_default.events_updated == 0
+        assert out_default.outcomes[0].decision == DecisionType.AMBIGUOUS_CANDIDATE
+        assert out_default.outcomes[0].assigned_event_id is None
+
+        # 2. assign_ambiguous = True
+        res_assigned = EventResolver(policy=MatchPolicy(assign_ambiguous=True))
+        out_assigned = res_assigned.resolve_observations([ambig_obs], existing_events=[existing_event])
+        assert out_assigned.ambiguous_count == 1
+        assert out_assigned.events_updated == 1
+        assert out_assigned.outcomes[0].decision == DecisionType.AMBIGUOUS_CANDIDATE
+        assert out_assigned.outcomes[0].assigned_event_id == "evt_ambig_target"
+
+    def test_multi_event_bridging_merge_candidate(self) -> None:
+        """Verify an observation matching multiple distinct events >= match_threshold creates a MergeCandidate."""
+        t0 = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+        ev1 = UnifiedDisasterEvent(
+            event_id="evt_bridge_01",
+            event_type="flood",
+            location="Central Valley North",
+            start_time=t0,
+            summary="North Flood",
+            observation_ids=["obs_n"],
+            source_ids=["src_n"],
+            metadata={"centroid": {"latitude": 38.000, "longitude": -121.500}},
+            created_at=t0,
+            updated_at=t0,
+        )
+        ev2 = UnifiedDisasterEvent(
+            event_id="evt_bridge_02",
+            event_type="flood",
+            location="Central Valley South",
+            start_time=t0,
+            summary="South Flood",
+            observation_ids=["obs_s"],
+            source_ids=["src_s"],
+            metadata={"centroid": {"latitude": 38.005, "longitude": -121.505}},
+            created_at=t0,
+            updated_at=t0,
+        )
+        bridge_obs = DisasterObservation(
+            observation_id="obs_bridge",
+            source_id="src_bridge",
+            event_type="flood",
+            location="Central Valley",
+            latitude=38.002,
+            longitude=-121.502,
+            event_time=t0,
+        )
+
+        resolver = EventResolver()
+        res = resolver.resolve_observations([bridge_obs], existing_events=[ev1, ev2])
+
+        assert res.outcomes[0].decision == DecisionType.MERGE_CANDIDATE
+        assert len(res.merge_candidates) == 1
+        mc = res.merge_candidates[0]
+        assert mc.bridging_observation_id == "obs_bridge"
+        assert {mc.primary_event_id, mc.secondary_event_id} == {"evt_bridge_01", "evt_bridge_02"}
+        assert mc.status == "pending_review"
+
+    def test_conflicting_fields_synthesis(self) -> None:
+        """Verify synthesis of multiple observations with conflicting severities and locations preserves claims."""
+        t0 = datetime(2026, 6, 1, 12, 0, tzinfo=timezone.utc)
+        obs1 = DisasterObservation(
+            observation_id="obs_conf_1",
+            source_id="src_sensor",
+            event_type="wildfire",
+            location="North Ridge Forest",
+            latitude=35.0,
+            longitude=-119.0,
+            severity="moderate",
+            event_time=t0,
+        )
+        obs2 = DisasterObservation(
+            observation_id="obs_conf_2",
+            source_id="src_satellite",
+            event_type="wildfire",
+            location="North Ridge Upper Basin",
+            latitude=35.01,
+            longitude=-119.01,
+            severity="critical",
+            event_time=t0,
+        )
+
+        resolver = EventResolver()
+        res = resolver.resolve_observations([obs1, obs2])
+
+        assert len(res.resolved_events) == 1
+        ev = res.resolved_events[0]
+        # Resolved severity takes highest severity
+        assert ev.severity == "critical"
+        # Conflicting claim from obs1 is recorded
+        assert len(ev.conflicting_claims) >= 1
+        sev_conflicts = [c for c in ev.conflicting_claims if c.field_name == "severity"]
+        assert len(sev_conflicts) == 1
+        assert sev_conflicts[0].claimed_value == "moderate"
+        assert sev_conflicts[0].observation_id == "obs_conf_1"

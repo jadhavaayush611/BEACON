@@ -519,3 +519,129 @@ class TestStorageResolutionUnit:
         assert len(results) == 2
         # Ordering must be start_time desc: evt_query_eff_2 (hours=2), then evt_query_eff_0 (hours=0)
         assert [r.event_id for r in results] == ["evt_query_eff_2", "evt_query_eff_0"]
+
+    def test_repeated_resolution_appends_decision_history_and_deduplicates_merge_candidates(
+        self, mem_session: Session
+    ) -> None:
+        """Verify repeated save_resolution_result calls append to resolution_decisions
+
+        while idempotently updating merge_candidates and preserving reviewed status.
+        """
+        from beacon.storage.schema import MergeCandidateModel, ResolutionDecisionModel
+        from sqlalchemy import select
+
+        repo = StorageRepository()
+        t0 = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+        ev1 = UnifiedDisasterEvent(
+            event_id="evt_rep_01",
+            event_type="wildfire",
+            location="Pine Valley",
+            start_time=t0,
+            summary="Wildfire profile 1",
+            observation_ids=["obs_rep_01"],
+            source_ids=["src_rep_01"],
+            created_at=t0,
+            updated_at=t0,
+        )
+        ev2 = UnifiedDisasterEvent(
+            event_id="evt_rep_02",
+            event_type="wildfire",
+            location="Pine Ridge",
+            start_time=t0,
+            summary="Wildfire profile 2",
+            observation_ids=["obs_rep_02"],
+            source_ids=["src_rep_02"],
+            created_at=t0,
+            updated_at=t0,
+        )
+        mc = MergeCandidate(
+            primary_event_id="evt_rep_01",
+            secondary_event_id="evt_rep_02",
+            bridging_observation_id="obs_rep_bridge",
+            similarity_score=0.88,
+            rationale="Bridge observation matches both events",
+            status="pending_review",
+        )
+        outcome1 = ResolutionOutcome(
+            observation_id="obs_rep_01",
+            assigned_event_id="evt_rep_01",
+            decision=DecisionType.NO_MATCH,
+            score=0.0,
+            is_new_event=True,
+            rationale="Initial event creation",
+        )
+        res_run1 = ResolutionResult(
+            total_observations=1,
+            events_created=1,
+            events_updated=0,
+            observations_assigned=1,
+            ambiguous_count=0,
+            outcomes=[outcome1],
+            merge_candidates=[mc],
+            resolved_events=[ev1, ev2],
+        )
+
+        # 1. First persistence run
+        repo.save_resolution_result(res_run1, mem_session)
+        mem_session.commit()
+
+        # Check initial state
+        decisions_run1 = mem_session.execute(select(ResolutionDecisionModel)).scalars().all()
+        assert len(decisions_run1) == 1
+        assert decisions_run1[0].decision_type == "no_match"
+
+        merges_run1 = mem_session.execute(select(MergeCandidateModel)).scalars().all()
+        assert len(merges_run1) == 1
+        assert merges_run1[0].status == "pending_review"
+
+        # Simulate reviewer approving/merging candidate
+        merges_run1[0].status = "reviewed"
+        mem_session.commit()
+
+        # 2. Second persistence run (idempotent rerun with updated outcome and symmetric merge candidate)
+        outcome2 = ResolutionOutcome(
+            observation_id="obs_rep_01",
+            assigned_event_id="evt_rep_01",
+            decision=DecisionType.IDEMPOTENT_RE_OBSERVATION,
+            score=0.92,
+            is_new_event=False,
+            rationale="Repeat execution re-observation",
+        )
+        # Note: symmetric candidate with reversed primary/secondary
+        mc_symmetric = MergeCandidate(
+            primary_event_id="evt_rep_02",
+            secondary_event_id="evt_rep_01",
+            bridging_observation_id="obs_rep_bridge",
+            similarity_score=0.90,
+            rationale="Updated bridging rationale",
+            status="pending_review",
+        )
+        res_run2 = ResolutionResult(
+            total_observations=1,
+            events_created=0,
+            events_updated=1,
+            observations_assigned=1,
+            ambiguous_count=0,
+            outcomes=[outcome2],
+            merge_candidates=[mc_symmetric],
+            resolved_events=[ev1, ev2],
+        )
+
+        repo.save_resolution_result(res_run2, mem_session)
+        mem_session.commit()
+
+        # Verify decisions table: APPEND-ONLY history (now 2 rows)
+        all_decisions = mem_session.execute(
+            select(ResolutionDecisionModel).order_by(ResolutionDecisionModel.id)
+        ).scalars().all()
+        assert len(all_decisions) == 2
+        assert all_decisions[0].decision_type == "no_match"
+        assert all_decisions[1].decision_type == "idempotent_re_observation"
+        assert all_decisions[1].composite_score == 0.92
+
+        # Verify merge_candidates table: DEDUPLICATED (still exactly 1 row)
+        all_merges = mem_session.execute(select(MergeCandidateModel)).scalars().all()
+        assert len(all_merges) == 1
+        assert all_merges[0].similarity_score == 0.90
+        # Critical guarantee: reviewer status was preserved and NOT regressed to pending_review!
+        assert all_merges[0].status == "reviewed"
