@@ -15,10 +15,42 @@ from beacon.models import UnifiedDisasterEvent
 
 DASHBOARD_CSS = """
 <style>
-/* BEACON Design System */
+/* BEACON Command Center Design System */
 .beacon-header {
-    margin-bottom: 1.5rem;
+    margin-bottom: 1rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid #e2e8f0;
 }
+
+.beacon-title {
+    font-size: 1.85rem;
+    font-weight: 700;
+    color: #0f172a;
+    letter-spacing: -0.025em;
+    margin-bottom: 0.2rem;
+}
+
+.beacon-subtitle {
+    font-size: 0.95rem;
+    color: #475569;
+    font-weight: 400;
+}
+
+.beacon-status-pill {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    padding: 0.25rem 0.65rem;
+    font-size: 0.75rem;
+    font-weight: 600;
+    border-radius: 9999px;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+}
+
+.status-live { background-color: #ecfdf5; color: #047857; border: 1px solid #a7f3d0; }
+.status-memory { background-color: #fffbeb; color: #b45309; border: 1px solid #fde68a; }
+.status-error { background-color: #fef2f2; color: #b91c1c; border: 1px solid #fecaca; }
 
 .beacon-badge {
     display: inline-block;
@@ -49,6 +81,25 @@ DASHBOARD_CSS = """
     background-color: #ffffff;
     margin-bottom: 1rem;
     box-shadow: 0 1px 2px rgba(0, 0, 0, 0.04);
+}
+
+.beacon-kpi-card {
+    background-color: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 1rem 1.15rem;
+    margin-bottom: 0.75rem;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+    border-top: 3px solid #2563eb;
+}
+
+.beacon-format-card {
+    background-color: #ffffff;
+    border: 1px solid #e2e8f0;
+    border-radius: 8px;
+    padding: 0.85rem 1rem;
+    margin-bottom: 0.65rem;
+    box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
 }
 
 .beacon-metric-subtext {
@@ -90,6 +141,15 @@ def get_corroboration_badge_html(source_count: int) -> str:
     if source_count > 1:
         return f'<span class="beacon-badge badge-multi-source">MULTI-SOURCE ({source_count})</span>'
     return '<span class="beacon-badge badge-single-source">SINGLE-SOURCE</span>'
+
+
+def get_system_status_pill_html(is_connected: bool, schema_ready: bool) -> str:
+    """Generate HTML status badge for system operational indicator."""
+    if schema_ready:
+        return '<span class="beacon-status-pill status-live">● POSTGRESQL ONLINE</span>'
+    elif is_connected:
+        return '<span class="beacon-status-pill status-memory">● SCHEMA UNINITIALIZED</span>'
+    return '<span class="beacon-status-pill status-memory">● IN-MEMORY (STATELESS)</span>'
 
 
 # ==============================================================================

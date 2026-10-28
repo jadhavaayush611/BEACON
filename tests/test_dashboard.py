@@ -158,9 +158,36 @@ class TestDashboardService:
 
         assert status["connected"]
         assert status["status"] == "healthy"
+        assert len(status["tables"]) == 8
         assert "events" in status["tables"]
         assert "observations" in status["tables"]
         assert "sources" in status["tables"]
+        assert "pipeline_runs" in status["tables"]
+        assert status["total_tables"] == 8
+        assert status["ready_tables"] == 8
+
+    def test_database_connection_diagnostics_partial_schema(self) -> None:
+        """Diagnostics accurately reflect partial schema readiness with dynamic counts."""
+        from beacon.storage.schema import Base, EventModel, SourceModel
+
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(bind=engine, tables=[SourceModel.__table__, EventModel.__table__])
+        factory = sessionmaker(bind=engine, expire_on_commit=False)
+        service = DashboardService(
+            settings=Settings(database_url="sqlite:///:memory:"), session_factory=factory
+        )
+
+        status = service.test_database_connection()
+        assert status["connected"] is True
+        assert status["schema_ready"] is False
+        assert status["status"] == "uninitialized"
+        assert status["total_tables"] == 8
+        assert status["ready_tables"] == 2
+        assert status["tables"]["sources"] == 0
+        assert status["tables"]["events"] == 0
+        assert status["tables"]["pipeline_runs"] == -1
+        assert "6 required table(s) are missing" in status["message"]
+        assert "pipeline_runs" in status["message"]
 
     def test_process_uploaded_files(self, dashboard_service: DashboardService) -> None:
         """File upload processing ingests valid disaster files and cleans up temporary directory."""
@@ -712,6 +739,17 @@ class TestDashboardService:
         assert post_overview["compression_ratio"] == 1.43
         assert post_overview["sources_count"] == 4
 
+    def test_required_tables_matches_declarative_schema(self) -> None:
+        """Ensure REQUIRED_TABLES dynamically aligns with all Base declarative models."""
+        from beacon.dashboard.services import REQUIRED_TABLES, REQUIRED_TABLE_MODELS
+        from beacon.storage.schema import Base
+
+        declared_tables = set(Base.metadata.tables.keys())
+        required_names = set(REQUIRED_TABLES)
+        assert required_names == declared_tables
+        assert len(REQUIRED_TABLE_MODELS) == len(declared_tables)
+        assert "pipeline_runs" in required_names
+
     def test_sample_observation_files_separated_from_manifest(self) -> None:
         """Sample data directory separates 5 input observation files from the manifest specification."""
         sample_dir = Path("data/sample")
@@ -879,7 +917,10 @@ class TestDashboardService:
         assert diag["status"] == "uninitialized"
         assert "Run 'python scripts/init_db.py'" in diag["message"]
 
-        # All 7 tables report -1 (missing)
+        # All 8 tables report -1 (missing)
+        assert len(diag["tables"]) == 8
+        assert diag["total_tables"] == 8
+        assert diag["ready_tables"] == 0
         for t in [
             "sources",
             "observations",
@@ -888,6 +929,7 @@ class TestDashboardService:
             "event_observations",
             "resolution_decisions",
             "merge_candidates",
+            "pipeline_runs",
         ]:
             assert diag["tables"][t] == -1
 
@@ -993,6 +1035,41 @@ class TestDashboardFormatters:
         # None ratio safe handling
         none_msg = explain_compression_ratio(0, 0, None)
         assert "N/A" in none_msg
+
+    def test_dashboard_formatters_and_app_module_imports(self) -> None:
+        """Regression test: verify dashboard module and formatters import without ImportError.
+
+        Ensures explain_compression_ratio is properly exported from both
+        beacon.dashboard.formatters and beacon.dashboard, and that beacon.dashboard.app
+        resolves all formatting imports cleanly.
+        """
+        import importlib
+
+        # Direct import from formatters module
+        from beacon.dashboard.formatters import (
+            explain_compression_ratio as direct_explain,
+        )
+
+        assert callable(direct_explain)
+
+        # Import via package-level re-export
+        import beacon.dashboard as dashboard_pkg
+
+        assert hasattr(dashboard_pkg, "explain_compression_ratio")
+        assert callable(dashboard_pkg.explain_compression_ratio)
+        assert hasattr(dashboard_pkg, "formatters")
+        assert hasattr(dashboard_pkg.formatters, "explain_compression_ratio")
+
+        # __all__ export contracts
+        import beacon.dashboard.formatters as formatters_mod
+
+        assert "explain_compression_ratio" in formatters_mod.__all__
+        assert "explain_compression_ratio" in dashboard_pkg.__all__
+
+        # App module import resolution
+        app_mod = importlib.import_module("beacon.dashboard.app")
+        assert hasattr(app_mod, "explain_compression_ratio")
+        assert callable(app_mod.explain_compression_ratio)
 
     def test_format_observation_row_fully_populated(self) -> None:
         """Fully populated observation produces complete formatted dictionary."""
@@ -1222,3 +1299,86 @@ class TestDashboardDesignSystem:
         # Verify feed dataframes are rendered without error
         dfs = at.dataframe
         assert len(dfs) >= 2
+
+    def test_default_ui_does_not_expose_connection_strings_or_endpoints(
+        self, isolate_in_memory_dashboard: None
+    ) -> None:
+        """Verify the Command Center UI strictly redacts sensitive database connection endpoints."""
+        if not _can_create_socketpair():
+            pytest.skip("Local loopback socket connection forbidden in sandboxed environment")
+        from streamlit.testing.v1 import AppTest
+
+        app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
+        at = AppTest.from_file(str(app_path), default_timeout=30)
+        at.run()
+
+        assert not at.exception
+
+        # Collect all rendered text across all UI elements
+        rendered_texts: list[str] = []
+        for elem_list in [
+            at.markdown,
+            at.caption,
+            at.info,
+            at.warning,
+            at.error,
+            at.success,
+        ]:
+            for item in elem_list:
+                val = getattr(item, "value", None)
+                if isinstance(val, str):
+                    rendered_texts.append(val)
+
+        for txt in at.text:
+            val = getattr(txt, "value", None)
+            if isinstance(val, str):
+                rendered_texts.append(val)
+
+        all_rendered = " \n ".join(rendered_texts)
+
+        # Assert no database URLs, host topologies, credentials, or ports leak
+        assert "postgresql://" not in all_rendered
+        assert "psycopg://" not in all_rendered
+        assert "localhost:5432" not in all_rendered
+        assert "@localhost" not in all_rendered
+        assert "user:pass" not in all_rendered
+        assert "Connected Endpoint:" not in all_rendered
+        assert "Host: `" not in all_rendered
+
+    def test_ingestion_ui_does_not_render_raw_manifest(
+        self, isolate_in_memory_dashboard: None
+    ) -> None:
+        """Verify the Command Center Ingestion UI hides raw manifest specification JSON and shows format matrix."""
+        if not _can_create_socketpair():
+            pytest.skip("Local loopback socket connection forbidden in sandboxed environment")
+        from streamlit.testing.v1 import AppTest
+
+        app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
+        at = AppTest.from_file(str(app_path), default_timeout=30)
+        at.run()
+
+        assert not at.exception
+
+        # Verify no raw manifest viewer expander exists
+        expander_labels = [e.label for e in at.expander]
+        assert not any("Manifest Specification" in lbl for lbl in expander_labels)
+
+        # Verify raw manifest dictionary is not dumped into at.json
+        for j in at.json:
+            val = getattr(j, "value", "")
+            assert "manifest_version" not in str(val)
+
+        # Verify supported format matrix and OCR limitation notices are present
+        markdown_texts = [m.value for m in at.markdown]
+        combined_markdown = " \n ".join(markdown_texts)
+
+        assert "JSON Extractor" in combined_markdown
+        assert "CSV Extractor" in combined_markdown
+        assert "TXT Extractor" in combined_markdown
+        assert "PDF Extractor" in combined_markdown
+        assert "Raster Image Extractor" in combined_markdown
+        assert "OCR Limitation" in combined_markdown
+
+        # Verify OCR limitation warning banner is displayed
+        warn_texts = [w.value for w in at.warning]
+        assert any("Optical Character Recognition (OCR) is explicitly not claimed" in w for w in warn_texts)

@@ -10,6 +10,19 @@ from typing import Any, Optional
 
 from beacon.models import ConflictingClaim, DisasterObservation
 
+__all__ = [
+    "explain_compression_ratio",
+    "format_compression_ratio",
+    "format_confidence",
+    "format_conflict_claim_markdown",
+    "format_conflict_claim_row",
+    "format_coordinates",
+    "format_decision_row",
+    "format_observation_row",
+    "format_score",
+    "format_timestamp",
+]
+
 
 def format_confidence(confidence: Optional[float]) -> str:
     """Format extraction confidence score to 2 decimal places or 'N/A' if missing.

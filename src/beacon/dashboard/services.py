@@ -18,6 +18,7 @@ from beacon.analytics.models import AnalyticsFilter, AnalyticsSummary
 from beacon.analytics.service import AnalyticsService
 from beacon.config import Settings, get_settings
 from beacon.ingestion import IngestionResult, ingest_file
+from beacon.logging_config import redact_sensitive_text
 from beacon.models import DisasterObservation, UnifiedDisasterEvent
 from beacon.pipeline.result import ETLPipelineResult, PipelineRunRecord
 from beacon.pipeline.runner import ETLRunner
@@ -26,7 +27,7 @@ from beacon.storage import (
     EventObservationModel,
     MergeCandidateModel,
     ObservationModel,
-
+    PipelineRunModel,
     QualityResultModel,
     ResolutionDecisionModel,
     SourceModel,
@@ -38,16 +39,18 @@ from beacon.storage import (
 
 logger = logging.getLogger("beacon.dashboard.services")
 
-REQUIRED_TABLES: tuple[str, ...] = (
-    "sources",
-    "observations",
-    "data_quality_results",
-    "events",
-    "event_observations",
-    "resolution_decisions",
-    "merge_candidates",
-    "pipeline_runs",
+REQUIRED_TABLE_MODELS: tuple[tuple[type, str], ...] = (
+    (SourceModel, "sources"),
+    (ObservationModel, "observations"),
+    (QualityResultModel, "data_quality_results"),
+    (EventModel, "events"),
+    (EventObservationModel, "event_observations"),
+    (ResolutionDecisionModel, "resolution_decisions"),
+    (MergeCandidateModel, "merge_candidates"),
+    (PipelineRunModel, "pipeline_runs"),
 )
+
+REQUIRED_TABLES: tuple[str, ...] = tuple(name for _, name in REQUIRED_TABLE_MODELS)
 
 
 class DashboardService:
@@ -124,18 +127,13 @@ class DashboardService:
                 "status": "unconfigured",
                 "message": "BEACON_DATABASE_URL is not set. Running in-memory mode.",
                 "database_url_masked": "None",
+                "engine_type": "In-Memory",
                 "tables": {},
+                "total_tables": len(REQUIRED_TABLES),
+                "ready_tables": 0,
             }
 
-        # Mask password in URL for display safety
-        raw_url = str(self.settings.database_url)
-        masked_url = raw_url
-        if "@" in raw_url and "://" in raw_url:
-            scheme, rest = raw_url.split("://", 1)
-            creds, host_part = rest.split("@", 1)
-            if ":" in creds:
-                user, _ = creds.split(":", 1)
-                masked_url = f"{scheme}://{user}:****@{host_part}"
+        masked_url = "[REDACTED]"
 
         try:
             factory = self.session_factory
@@ -146,15 +144,7 @@ class DashboardService:
             with get_session(factory) as session:
                 inspector = inspect(session.get_bind())
                 existing_tables = set(inspector.get_table_names())
-                for model, name in [
-                    (SourceModel, "sources"),
-                    (ObservationModel, "observations"),
-                    (QualityResultModel, "data_quality_results"),
-                    (EventModel, "events"),
-                    (EventObservationModel, "event_observations"),
-                    (ResolutionDecisionModel, "resolution_decisions"),
-                    (MergeCandidateModel, "merge_candidates"),
-                ]:
+                for model, name in REQUIRED_TABLE_MODELS:
                     if name in existing_tables:
                         try:
                             count = session.execute(select(func.count()).select_from(model)).scalar() or 0
@@ -164,6 +154,8 @@ class DashboardService:
                     else:
                         tables_count[name] = -1  # Table does not exist
 
+            total_required = len(REQUIRED_TABLES)
+            ready_count = sum(1 for c in tables_count.values() if c >= 0)
             missing = [name for name, count in tables_count.items() if count == -1]
             if missing:
                 return {
@@ -175,7 +167,10 @@ class DashboardService:
                         f"{', '.join(missing)}. Run 'python scripts/init_db.py' to initialize the schema."
                     ),
                     "database_url_masked": masked_url,
+                    "engine_type": "PostgreSQL",
                     "tables": tables_count,
+                    "total_tables": total_required,
+                    "ready_tables": ready_count,
                 }
 
             return {
@@ -184,16 +179,22 @@ class DashboardService:
                 "status": "healthy",
                 "message": "Connected to database successfully.",
                 "database_url_masked": masked_url,
+                "engine_type": "PostgreSQL",
                 "tables": tables_count,
+                "total_tables": total_required,
+                "ready_tables": ready_count,
             }
         except Exception as err:
             return {
                 "connected": False,
                 "schema_ready": False,
                 "status": "error",
-                "message": f"Connection failed: {err}",
+                "message": f"Connection failed: {redact_sensitive_text(str(err))}",
+                "engine_type": "PostgreSQL",
                 "database_url_masked": masked_url,
                 "tables": {},
+                "total_tables": len(REQUIRED_TABLES),
+                "ready_tables": 0,
             }
 
     def get_system_overview(self) -> dict[str, Any]:
