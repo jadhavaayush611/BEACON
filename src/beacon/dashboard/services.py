@@ -9,6 +9,7 @@ import logging
 from pathlib import Path
 import shutil
 import tempfile
+import time
 from typing import Any, Optional, Sequence, Union
 
 from sqlalchemy import distinct, func, inspect, select, text
@@ -254,6 +255,339 @@ class DashboardService:
             "events_by_severity": summary.events_by_severity,
             "is_live_db": False,
         }
+
+    def ingest_and_process_uploads(
+        self,
+        uploads: Sequence[tuple[str, bytes]],
+        enable_resolution: bool = True,
+        persist_db: bool = True,
+    ) -> dict[str, Any]:
+        """Execute complete structured multi-stage ingestion pipeline for uploaded files.
+
+        Implements all 9 operational stages:
+        1. File received
+        2. File type and integrity validation
+        3. Format-specific extraction
+        4. Normalization and field mapping
+        5. Data-quality validation
+        6. Observation creation
+        7. Event matching and resolution
+        8. Persistence (transactional PostgreSQL with rollback, or stateless in-memory)
+        9. Final summary
+
+        Guarantees idempotent persistence, partial-failure tolerance, and zero-fabrication.
+        """
+        start_ts = time.time()
+        stages: list[dict[str, Any]] = []
+        errors: list[str] = []
+        warnings: list[str] = []
+
+        temp_dir = Path(tempfile.mkdtemp(prefix="beacon_upload_"))
+        try:
+            # Stage 1: File Received
+            t0 = time.time()
+            total_files = len(uploads)
+            stages.append({
+                "stage_id": "files_received",
+                "name": "1. File Received",
+                "status": "completed" if total_files > 0 else "failed",
+                "message": f"Received {total_files} file payload(s) for multi-format processing.",
+                "counts": {"files_received": total_files},
+                "elapsed": round(time.time() - t0, 3),
+            })
+            if total_files == 0:
+                return {
+                    "stages": stages,
+                    "ingestion_results": [],
+                    "observations": [],
+                    "events": [],
+                    "resolution_outcomes": [],
+                    "persistence_mode": "none",
+                    "errors": ["No files uploaded."],
+                    "warnings": [],
+                }
+
+            # Stage 2: File Type & Integrity Validation
+            t0 = time.time()
+            valid_files: list[tuple[str, bytes, Path]] = []
+            invalid_files: list[tuple[str, str]] = []
+            from beacon.ingestion.dispatcher import EXTENSION_INGESTOR_MAP
+
+            for filename, content in uploads:
+                safe_name = Path(filename).name
+                ext = Path(safe_name).suffix.lower()
+                if ext not in EXTENSION_INGESTOR_MAP:
+                    invalid_files.append((safe_name, f"Unsupported format '{ext}'"))
+                elif len(content) == 0:
+                    invalid_files.append((safe_name, "Zero-byte empty file payload"))
+                else:
+                    file_path = temp_dir / safe_name
+                    file_path.write_bytes(content)
+                    valid_files.append((safe_name, content, file_path))
+
+            stage2_status = "completed"
+            if invalid_files and valid_files:
+                stage2_status = "warning"
+                warnings.extend([f"[{fn}]: {reason}" for fn, reason in invalid_files])
+            elif invalid_files and not valid_files:
+                stage2_status = "failed"
+                errors.extend([f"[{fn}]: {reason}" for fn, reason in invalid_files])
+
+            stages.append({
+                "stage_id": "validation_integrity",
+                "name": "2. File Type & Integrity Validation",
+                "status": stage2_status,
+                "message": f"Validated {len(valid_files)}/{total_files} file(s) across recognized format signatures.",
+                "counts": {"files_valid": len(valid_files), "files_invalid": len(invalid_files)},
+                "details": [f"{fn}: {r}" for fn, r in invalid_files] if invalid_files else None,
+                "elapsed": round(time.time() - t0, 3),
+            })
+
+            # Stage 3: Format-Specific Extraction
+            t0 = time.time()
+            ingestion_results: list[IngestionResult] = []
+            extracted_observations: list[DisasterObservation] = []
+            for safe_name, _content, file_path in valid_files:
+                res = ingest_file(file_path, raise_on_unsupported=False, raise_on_missing=False)
+                ingestion_results.append(res)
+                extracted_observations.extend(res.observations)
+                if res.errors:
+                    errors.extend([f"[{safe_name}]: {e}" for e in res.errors])
+                if res.warnings:
+                    warnings.extend([f"[{safe_name}]: {w}" for w in res.warnings])
+
+            files_succeeded = sum(1 for r in ingestion_results if r.is_success)
+            files_failed = sum(1 for r in ingestion_results if r.is_failed) + len(invalid_files)
+            stage3_status = "completed"
+            if files_failed > 0 and files_succeeded > 0:
+                stage3_status = "warning"
+            elif files_failed > 0 and files_succeeded == 0:
+                stage3_status = "failed"
+
+            stages.append({
+                "stage_id": "extraction",
+                "name": "3. Format-Specific Extraction",
+                "status": stage3_status,
+                "message": f"Extracted {len(extracted_observations)} raw observation(s) from {len(valid_files)} file(s).",
+                "counts": {
+                    "observations_extracted": len(extracted_observations),
+                    "files_succeeded": files_succeeded,
+                    "files_failed": files_failed,
+                },
+                "elapsed": round(time.time() - t0, 3),
+            })
+
+            # Stage 4: Normalization & Field Mapping
+            t0 = time.time()
+            from beacon.pipeline.transform import ObservationTransformer
+            transformer = ObservationTransformer()
+            transformed_observations = transformer.transform_batch(extracted_observations)
+            stages.append({
+                "stage_id": "normalization",
+                "name": "4. Normalization & Field Mapping",
+                "status": "completed",
+                "message": f"Normalized spatial bounds, UTC temporal anchors, and severity levels for {len(transformed_observations)} record(s).",
+                "counts": {"observations_normalized": len(transformed_observations)},
+                "elapsed": round(time.time() - t0, 3),
+            })
+
+            # Stage 5: Data-Quality Validation
+            t0 = time.time()
+            from beacon.quality import DataQualityValidator
+            validator = DataQualityValidator()
+            quality_report = validator.validate(transformed_observations)
+            stage5_status = "completed"
+            if quality_report.rejected_record_ids:
+                stage5_status = "warning" if quality_report.accepted_records else "failed"
+
+            stages.append({
+                "stage_id": "data_quality",
+                "name": "5. Data-Quality Validation",
+                "status": stage5_status,
+                "message": f"Quality audit: {quality_report.passed_count} checks passed, {len(quality_report.accepted_records)} accepted, {len(quality_report.rejected_record_ids)} rejected.",
+                "counts": {
+                    "passed_checks": quality_report.passed_count,
+                    "records_accepted": len(quality_report.accepted_records),
+                    "records_rejected": len(quality_report.rejected_record_ids),
+                },
+                "elapsed": round(time.time() - t0, 3),
+            })
+
+            # Stage 6: Observation Creation
+            t0 = time.time()
+            accepted_observations = quality_report.accepted_records
+            stages.append({
+                "stage_id": "observation_creation",
+                "name": "6. Observation Creation",
+                "status": "completed",
+                "message": f"Formed {len(accepted_observations)} canonical disaster observation(s) with deterministic IDs.",
+                "counts": {"observations_ready": len(accepted_observations)},
+                "elapsed": round(time.time() - t0, 3),
+            })
+
+            # Stage 7: Event Matching & Resolution
+            t0 = time.time()
+            from beacon.resolution.resolver import EventResolver
+            resolver = EventResolver(settings=self.settings)
+            resolved_events: list[UnifiedDisasterEvent] = []
+            resolution_outcomes: list[Any] = []
+            resolution_result = None
+
+            if enable_resolution and accepted_observations:
+                if self.is_database_connected:
+                    assert self.session_factory is not None
+                    with get_session(self.session_factory) as session:
+                        existing_events, existing_event_obs = self.repository.get_all_events_with_observations(session)
+                else:
+                    existing_events = list(self._in_memory_events)
+                    existing_event_obs = {
+                        ev.event_id: [o for o in self._in_memory_observations if o.observation_id in ev.observation_ids]
+                        for ev in self._in_memory_events
+                    }
+
+                resolution_result = resolver.resolve_observations(
+                    accepted_observations,
+                    existing_events=existing_events,
+                    existing_event_observations=existing_event_obs,
+                )
+                resolved_events = resolution_result.resolved_events
+                resolution_outcomes = resolution_result.outcomes
+
+                stages.append({
+                    "stage_id": "event_resolution",
+                    "name": "7. Event Matching & Resolution",
+                    "status": "completed",
+                    "message": f"Synthesized {len(resolved_events)} canonical disaster event(s) ({resolution_result.events_created} new, {resolution_result.events_updated} updated).",
+                    "counts": {
+                        "events_synthesized": len(resolved_events),
+                        "events_created": resolution_result.events_created,
+                        "events_updated": resolution_result.events_updated,
+                        "ambiguous_count": resolution_result.ambiguous_count,
+                    },
+                    "elapsed": round(time.time() - t0, 3),
+                })
+            else:
+                stages.append({
+                    "stage_id": "event_resolution",
+                    "name": "7. Event Matching & Resolution",
+                    "status": "skipped",
+                    "message": "Event resolution skipped per user configuration." if not enable_resolution else "No accepted observations to resolve.",
+                    "counts": {"events_synthesized": 0},
+                    "elapsed": round(time.time() - t0, 3),
+                })
+
+            # Stage 8: Persistence
+            t0 = time.time()
+            records_persisted = 0
+            events_persisted = 0
+            persistence_mode = "in_memory"
+
+            can_persist_db = self.is_database_connected and persist_db
+            if can_persist_db:
+                assert self.session_factory is not None
+                try:
+                    with get_session(self.session_factory) as session:
+                        for file_res in ingestion_results:
+                            src_rec = file_res.source_record
+                            src_accepted = [o for o in accepted_observations if o.source_id == src_rec.source_id]
+                            src_outcomes = [o for o in quality_report.outcomes if o.source_id == src_rec.source_id]
+                            counts = self.repository.save_batch(
+                                source_record=src_rec,
+                                accepted_observations=src_accepted,
+                                quality_outcomes=src_outcomes,
+                                session=session,
+                            )
+                            records_persisted += counts["observations_persisted"]
+
+                        if resolution_result:
+                            res_counts = self.repository.save_resolution_result(resolution_result, session)
+                            events_persisted = res_counts.get("events_persisted", 0)
+
+                    persistence_mode = "postgresql"
+                    stages.append({
+                        "stage_id": "persistence",
+                        "name": "8. Persistence",
+                        "status": "completed",
+                        "message": f"Persisted {records_persisted} observation(s) and {events_persisted} event(s) to PostgreSQL.",
+                        "counts": {"records_persisted": records_persisted, "events_persisted": events_persisted},
+                        "elapsed": round(time.time() - t0, 3),
+                    })
+                except Exception as db_err:
+                    persistence_mode = "failed"
+                    err_msg = f"Database transaction failed: {redact_sensitive_text(str(db_err))}"
+                    errors.append(err_msg)
+                    stages.append({
+                        "stage_id": "persistence",
+                        "name": "8. Persistence",
+                        "status": "failed",
+                        "message": err_msg,
+                        "counts": {"records_persisted": 0, "events_persisted": 0},
+                        "elapsed": round(time.time() - t0, 3),
+                    })
+            else:
+                # In-memory persistence / caching
+                obs_map = {obs.observation_id: obs for obs in self._in_memory_observations}
+                for obs in accepted_observations:
+                    obs_map[obs.observation_id] = obs
+                self._in_memory_observations = list(obs_map.values())
+                if resolved_events:
+                    self._in_memory_events = resolved_events
+                if resolution_outcomes:
+                    self._in_memory_resolution_outcomes = resolution_outcomes
+
+                diag = self.test_database_connection()
+                if diag.get("connected") and not diag.get("schema_ready"):
+                    msg = "PostgreSQL connected but schema is incomplete: cached in-memory without persistent DB writes."
+                elif not self.settings.database_url:
+                    msg = "In-memory mode (stateless): cached in application session."
+                else:
+                    msg = "Persistence disabled by user: cached in-memory without persistent DB writes."
+
+                stages.append({
+                    "stage_id": "persistence",
+                    "name": "8. Persistence",
+                    "status": "warning",
+                    "message": msg,
+                    "counts": {"in_memory_cached": len(accepted_observations)},
+                    "elapsed": round(time.time() - t0, 3),
+                })
+
+            # Stage 9: Final Summary
+            total_elapsed = round(time.time() - start_ts, 3)
+            final_status = "completed"
+            if errors:
+                final_status = "failed" if files_succeeded == 0 else "warning"
+            elif warnings or stage2_status == "warning":
+                final_status = "warning"
+
+            stages.append({
+                "stage_id": "final_summary",
+                "name": "9. Final Summary",
+                "status": final_status,
+                "message": f"Processed {total_files} file(s) in {total_elapsed}s. {len(accepted_observations)} observation(s) accepted, {len(resolved_events)} event(s) active.",
+                "counts": {
+                    "total_files": total_files,
+                    "files_succeeded": files_succeeded,
+                    "observations_accepted": len(accepted_observations),
+                    "events_active": len(resolved_events),
+                },
+                "elapsed": total_elapsed,
+            })
+
+            return {
+                "stages": stages,
+                "ingestion_results": ingestion_results,
+                "observations": accepted_observations,
+                "events": resolved_events,
+                "resolution_outcomes": resolution_outcomes,
+                "quality_report": quality_report,
+                "persistence_mode": persistence_mode,
+                "errors": errors,
+                "warnings": warnings,
+            }
+        finally:
+            if temp_dir.exists() and temp_dir.name.startswith("beacon_upload_"):
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     def process_uploaded_files(
         self,

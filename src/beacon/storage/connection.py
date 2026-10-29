@@ -8,7 +8,34 @@ from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from beacon.config import Settings, get_settings
-from beacon.storage.schema import Base
+from beacon.storage.schema import (
+    Base,
+    EventModel,
+    EventObservationModel,
+    MergeCandidateModel,
+    ObservationModel,
+    PipelineRunModel,
+    QualityResultModel,
+    ResolutionDecisionModel,
+    SourceModel,
+)
+
+__all__ = [
+    "Base",
+    "create_db_engine",
+    "get_session_factory",
+    "get_session",
+    "init_db",
+    "drop_db",
+    "EventModel",
+    "EventObservationModel",
+    "MergeCandidateModel",
+    "ObservationModel",
+    "PipelineRunModel",
+    "QualityResultModel",
+    "ResolutionDecisionModel",
+    "SourceModel",
+]
 
 logger = logging.getLogger("beacon.storage.connection")
 

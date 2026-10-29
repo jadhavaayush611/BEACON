@@ -50,7 +50,11 @@ class BaseIngestor(ABC):
     ) -> SourceRecord:
         """Create a canonical SourceRecord instance with stable source_id."""
         normalized_path = str(path).replace("\\", "/")
-        source_id = generate_source_id(self.source_type, normalized_path, content_hash)
+        # Use stable filename fingerprint for uploaded files in managed temporary scratch directories
+        clean_target = path.name if "beacon_upload_" in normalized_path else normalized_path
+        if metadata and "original_filename" in metadata:
+            clean_target = metadata["original_filename"]
+        source_id = generate_source_id(self.source_type, clean_target, content_hash)
         meta = dict(metadata or {})
 
         return SourceRecord(

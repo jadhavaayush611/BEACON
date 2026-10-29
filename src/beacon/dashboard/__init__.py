@@ -4,10 +4,14 @@ from beacon.dashboard import formatters
 from beacon.dashboard.components import (
     extract_geographic_dataframe,
     get_corroboration_badge_html,
+    get_minecraft_beacon_svg,
     get_severity_badge_html,
-    inject_custom_styles,
     get_system_status_pill_html,
+    inject_custom_styles,
     render_empty_state,
+    render_observation_cards,
+    render_pipeline_timeline,
+    render_process_timeline,
 )
 from beacon.dashboard.formatters import (
     explain_compression_ratio,
@@ -38,8 +42,12 @@ __all__ = [
     "format_timestamp",
     "formatters",
     "get_corroboration_badge_html",
+    "get_minecraft_beacon_svg",
     "get_severity_badge_html",
     "get_system_status_pill_html",
     "inject_custom_styles",
     "render_empty_state",
+    "render_observation_cards",
+    "render_pipeline_timeline",
+    "render_process_timeline",
 ]

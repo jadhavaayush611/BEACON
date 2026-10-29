@@ -108,6 +108,20 @@ class TestPostgresStorageIntegration:
         engine, factory, _ = pg_disposable_schema
         init_db(engine)
 
+        from sqlalchemy import inspect
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        assert len(tables) == 8, f"Expected 8 tables, got {tables}"
+        assert "pipeline_runs" in tables, "pipeline_runs table missing from initialized PostgreSQL schema"
+
+        from beacon.dashboard.services import DashboardService
+        service = DashboardService(session_factory=factory)
+        diag = service.test_database_connection()
+        assert diag["connected"] is True
+        assert diag["schema_ready"] is True
+        assert diag["ready_tables"] == 8
+        assert diag["tables"]["pipeline_runs"] >= 0
+
         repository = StorageRepository()
         source_rec = SourceRecord(
             source_id="src_pg_fresh_001",

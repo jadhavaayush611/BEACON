@@ -2,7 +2,7 @@
 
 ## 1. Overview & Architecture
 
-BEACON uses a relational PostgreSQL storage architecture with seven relational tables:
+BEACON uses a relational PostgreSQL storage architecture with eight relational tables:
 
 | Table | Phase Introduced | Purpose | Constraints / Indexes |
 | :--- | :--- | :--- | :--- |
@@ -13,6 +13,7 @@ BEACON uses a relational PostgreSQL storage architecture with seven relational t
 | `event_observations` | Phase 4 (`v0.4-event-resolution`) | Junction table linking unified events to constituent observations | `PRIMARY KEY (id)`, FK to `events`, FK to `observations`, `CONSTRAINT uq_event_observation UNIQUE (event_id, observation_id)` |
 | `resolution_decisions` | Phase 4 (`v0.4-event-resolution`) | Explainable audit lineage recording matching scores and decision rationale | `PRIMARY KEY (id)`, FK to `observations`, FK to `events` |
 | `merge_candidates` | Phase 4 (`v0.4-event-resolution`) | Human review queue for potential multi-event bridge observations | `PRIMARY KEY (id)`, FK to `primary_event_id`, FK to `secondary_event_id` |
+| `pipeline_runs` | Phase 2B (`v1.0-dashboard`) | Execution telemetry, batch duration metrics, and operational audit trail | `PRIMARY KEY (run_id)`, indexed by `status`, `started_at`, `retry_of_run_id` |
 
 ---
 
@@ -21,7 +22,7 @@ BEACON uses a relational PostgreSQL storage architecture with seven relational t
 For new deployments or fresh test environments:
 
 ```bash
-# Initialize all 7 tables in PostgreSQL
+# Initialize all 8 tables in PostgreSQL
 python scripts/init_db.py --url postgresql+psycopg://username:password@localhost:5432/beacon_db
 
 # Re-initialize (drop all existing tables first and recreate)
@@ -35,6 +36,17 @@ python scripts/init_db.py --url postgresql+psycopg://username:password@localhost
 
 ## 3. Upgrading from Phase 3 (`v0.3-storage`) to Phase 4 / v1.0
 
+### Phase 2B / v1.0 Migration (Pipeline Execution Telemetry)
+If an existing database has the 7 Phase 4 tables and requires upgrading to v1.0, apply the additive `pipeline_runs` migration:
+
+```bash
+python scripts/migrate_v1_0.py --dry-run
+python scripts/migrate_v1_0.py --url postgresql+psycopg://username:password@localhost:5432/beacon_db
+```
+
+---
+
+### Phase 4 Migration (Event Resolution)
 If an existing database is already running with Phase 3 tables (`sources`, `observations`, `data_quality_results`), apply the additive Phase 4 migration without dropping or altering existing tables:
 
 ### Dry-Run Inspection

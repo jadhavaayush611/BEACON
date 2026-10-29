@@ -1382,3 +1382,396 @@ class TestDashboardDesignSystem:
         # Verify OCR limitation warning banner is displayed
         warn_texts = [w.value for w in at.warning]
         assert any("Optical Character Recognition (OCR) is explicitly not claimed" in w for w in warn_texts)
+
+    def test_minecraft_beacon_svg_generation(self) -> None:
+        """Verify original pixel-art Minecraft Beacon SVG contains expected elements and beam classes."""
+        from beacon.dashboard.components import get_minecraft_beacon_svg
+
+        svg_markup = get_minecraft_beacon_svg()
+        assert "<svg" in svg_markup
+        assert "</svg>" in svg_markup
+        assert 'shape-rendering="crispEdges"' in svg_markup
+        assert "beacon-animated-beam" in svg_markup
+        assert "beacon-particle-1" in svg_markup
+        assert "beacon-particle-2" in svg_markup
+        assert 'viewBox="0 0 100 130"' in svg_markup
+        # Ensure pure vector artwork without external image references
+        assert "<image" not in svg_markup
+        assert "href=" not in svg_markup
+
+    def test_reduced_motion_and_pixel_styling_css_tokens(self) -> None:
+        """Verify 8-bit CSS design system includes font fallbacks and prefers-reduced-motion queries."""
+        from beacon.dashboard.components import DASHBOARD_CSS
+
+        # Font stack with fallback
+        assert "Press Start 2P" in DASHBOARD_CSS
+        assert "Silkscreen" in DASHBOARD_CSS
+        assert "Courier New" in DASHBOARD_CSS
+        assert "ui-monospace" in DASHBOARD_CSS
+        assert "monospace" in DASHBOARD_CSS
+
+        # Reduced motion query
+        assert "@media (prefers-reduced-motion: reduce)" in DASHBOARD_CSS
+        assert "animation: none !important" in DASHBOARD_CSS
+
+        # KPI tags and pixel classes
+        assert ".kpi-tag-cyan" in DASHBOARD_CSS
+        assert ".kpi-tag-emerald" in DASHBOARD_CSS
+        assert ".kpi-tag-purple" in DASHBOARD_CSS
+        assert ".kpi-tag-amber" in DASHBOARD_CSS
+        assert ".beacon-empty-box" in DASHBOARD_CSS
+
+    def test_app_source_header_and_sidebar_branding(self) -> None:
+        """Verify dashboard application source configures 8-bit command center branding and subtitle."""
+        app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
+        app_source = app_path.read_text(encoding="utf-8")
+
+        assert "DISASTER INTELLIGENCE PIPELINE" in app_source
+        assert "BEACON COMMAND CENTER" in app_source
+        assert "get_minecraft_beacon_svg" in app_source
+        assert "kpi-tag-cyan" in app_source
+        assert "kpi-tag-emerald" in app_source
+
+    def test_sidebar_is_strictly_minimal(self) -> None:
+        """Verify the sidebar contains ONLY the animated beacon logo and the project name BEACON."""
+        app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
+        app_source = app_path.read_text(encoding="utf-8")
+
+        # Extract sidebar block
+        assert "with st.sidebar:" in app_source
+        sidebar_block = app_source.split("with st.sidebar:")[1].split("# Command Center Header")[0]
+
+        # Must contain only animated logo and BEACON name
+        assert "get_minecraft_beacon_svg()" in sidebar_block
+        assert "BEACON" in sidebar_block
+
+        # Must NOT contain database connection details, status banners, table counts, or architecture lists
+        assert "st.sidebar.success" not in sidebar_block
+        assert "st.sidebar.warning" not in sidebar_block
+        assert "st.sidebar.caption" not in sidebar_block
+        assert "tables online" not in sidebar_block
+        assert "Architecture Principles" not in sidebar_block
+        assert "Security Posture" not in sidebar_block
+
+    def test_sidebar_branding_placement_at_bottom(self) -> None:
+        """Verify sidebar branding is wrapped in bottom-placement container and CSS rules align it to bottom."""
+        from beacon.dashboard.components import DASHBOARD_CSS
+
+        app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
+        app_source = app_path.read_text(encoding="utf-8")
+
+        # Verify HTML wrapper in app.py
+        assert 'class="beacon-sidebar-footer"' in app_source
+        assert 'class="beacon-sidebar-wordmark"' in app_source
+
+        # Verify CSS rules enforce flexbox bottom positioning
+        assert 'section[data-testid="stSidebar"] div[data-testid="stSidebarUserContent"]' in DASHBOARD_CSS
+        assert "justify-content: flex-end !important;" in DASHBOARD_CSS
+        assert ".beacon-sidebar-footer" in DASHBOARD_CSS
+        assert "margin-top: auto !important;" in DASHBOARD_CSS
+        assert ".beacon-sidebar-wordmark" in DASHBOARD_CSS
+
+    def test_comprehensive_8bit_theme_component_tokens(self) -> None:
+        """Verify 8-bit theme covers tables, dropdown menus, inputs, buttons, expanders, and charts."""
+        from beacon.dashboard.components import DASHBOARD_CSS
+
+        # Tables and dataframes
+        assert 'div[data-testid="stDataFrame"]' in DASHBOARD_CSS
+        assert 'div[data-testid="stTable"]' in DASHBOARD_CSS
+        assert "thead th" in DASHBOARD_CSS
+        assert "tbody td" in DASHBOARD_CSS
+
+        # Dropdown popovers and multiselect tags
+        assert 'div[data-baseweb="popover"]' in DASHBOARD_CSS
+        assert 'li[data-baseweb="menu-item"]' in DASHBOARD_CSS
+        assert 'span[data-baseweb="tag"]' in DASHBOARD_CSS
+
+        # Buttons (preventing red default accents)
+        assert 'button[data-testid="baseButton-primary"]' in DASHBOARD_CSS
+        assert 'button[data-testid="baseButton-secondary"]' in DASHBOARD_CSS
+        assert "#0284c7" in DASHBOARD_CSS  # Primary button 8-bit cyan/blue accent
+
+        # Checkboxes, radios, and sliders
+        assert 'div[data-testid="stCheckbox"]' in DASHBOARD_CSS
+        assert 'div[data-testid="stRadio"]' in DASHBOARD_CSS
+        assert 'div[data-testid="stSlider"]' in DASHBOARD_CSS
+
+        # Expanders and file uploaders
+        assert 'div[data-testid="stExpander"]' in DASHBOARD_CSS
+        assert 'div[data-testid="stFileUploader"]' in DASHBOARD_CSS
+
+        # Charts and maps
+        assert 'div[data-testid="stDeckGlJsonChart"]' in DASHBOARD_CSS
+        assert 'div[data-testid="stPlotlyChart"]' in DASHBOARD_CSS
+
+    def test_sidebar_full_height_beam_and_reduced_motion(self) -> None:
+        """Verify full-height animated beam spans from top of sidebar down to beacon device."""
+        from beacon.dashboard.components import DASHBOARD_CSS
+
+        app_path = Path(__file__).parent.parent / "src" / "beacon" / "dashboard" / "app.py"
+        app_source = app_path.read_text(encoding="utf-8")
+
+        # Verify full-height beam markup in app.py
+        assert "beacon-sidebar-full-container" in app_source
+        assert "beacon-sidebar-full-beam" in app_source
+        assert "beacon-beam-glow" in app_source
+        assert "beacon-beam-laser" in app_source
+        assert "beacon-beam-mote" in app_source
+        assert "get_minecraft_beacon_svg()" in app_source
+
+        # Verify CSS beam positioning and animation rules
+        assert ".beacon-sidebar-full-beam" in DASHBOARD_CSS
+        assert "top: -5rem !important;" in DASHBOARD_CSS
+        assert "bottom: 85px !important;" in DASHBOARD_CSS
+        assert ".beacon-beam-glow" in DASHBOARD_CSS
+        assert ".beacon-beam-mid" in DASHBOARD_CSS
+        assert ".beacon-beam-core" in DASHBOARD_CSS
+        assert ".beacon-beam-laser" in DASHBOARD_CSS
+        assert "beacon-full-mote" in DASHBOARD_CSS
+
+        # Reduced motion behavior
+        assert ".beacon-beam-mote {" in DASHBOARD_CSS
+        assert "display: none !important;" in DASHBOARD_CSS
+
+    def test_8bit_theme_json_and_upload_chips(self) -> None:
+        """Verify 8-bit theme covers JSON tree viewers and file upload chips."""
+        from beacon.dashboard.components import DASHBOARD_CSS
+
+        assert 'div[data-testid="stJson"]' in DASHBOARD_CSS
+        assert 'div[data-testid="stFileUploaderFile"]' in DASHBOARD_CSS
+        assert 'button[data-testid="stFileUploaderDeleteFile"]' in DASHBOARD_CSS
+        assert 'div[data-testid="stDateInput"]' in DASHBOARD_CSS
+        assert '.beacon-timeline-container' in DASHBOARD_CSS
+        assert '.beacon-obs-card' in DASHBOARD_CSS
+
+    def test_ingest_and_process_uploads_complete_9_stages(self, dashboard_service: DashboardService) -> None:
+        """Verify ingest_and_process_uploads executes all 9 stages with real metrics."""
+        sample_path = Path(__file__).parent.parent / "data" / "sample" / "events.json"
+        if not sample_path.exists():
+            pytest.skip("Sample data not available")
+
+        content = sample_path.read_bytes()
+        result = dashboard_service.ingest_and_process_uploads(
+            uploads=[("events.json", content)],
+            enable_resolution=True,
+            persist_db=False,
+        )
+
+        stages = result["stages"]
+        assert len(stages) == 9
+        stage_ids = [s["stage_id"] for s in stages]
+        assert stage_ids == [
+            "files_received",
+            "validation_integrity",
+            "extraction",
+            "normalization",
+            "data_quality",
+            "observation_creation",
+            "event_resolution",
+            "persistence",
+            "final_summary",
+        ]
+
+        # Stage 1: Received
+        assert stages[0]["status"] == "completed"
+        assert stages[0]["counts"]["files_received"] == 1
+
+        # Stage 2: Valid
+        assert stages[1]["status"] == "completed"
+        assert stages[1]["counts"]["files_valid"] == 1
+
+        # Stage 3: Extraction
+        assert stages[2]["status"] == "completed"
+        assert stages[2]["counts"]["observations_extracted"] > 0
+
+        # Stage 7: Resolution
+        assert stages[6]["status"] == "completed"
+        assert stages[6]["counts"]["events_synthesized"] > 0
+
+        # Stage 8: Persistence (in-memory mode)
+        assert stages[7]["status"] == "warning"
+        assert "in-memory" in stages[7]["message"].lower()
+
+        # Stage 9: Final summary
+        assert stages[8]["status"] == "completed"
+
+    def test_ingest_and_process_uploads_partial_failure_isolation(self, dashboard_service: DashboardService) -> None:
+        """Verify partial failure when some files succeed and an unsupported file fails."""
+        sample_path = Path(__file__).parent.parent / "data" / "sample" / "events.json"
+        if not sample_path.exists():
+            pytest.skip("Sample data not available")
+
+        content = sample_path.read_bytes()
+        result = dashboard_service.ingest_and_process_uploads(
+            uploads=[("events.json", content), ("corrupt_data.xyz", b"invalid data")],
+            enable_resolution=True,
+            persist_db=False,
+        )
+
+        stages = result["stages"]
+        assert len(stages) == 9
+        # Stage 2 should show warning because 1 file was invalid
+        assert stages[1]["status"] == "warning"
+        assert stages[1]["counts"]["files_valid"] == 1
+        assert stages[1]["counts"]["files_invalid"] == 1
+
+        # Valid observations from events.json are still successfully extracted and retained
+        assert len(result["observations"]) > 0
+        assert len(result["events"]) > 0
+
+    def test_reprocessing_same_file_is_idempotent(self, dashboard_service: DashboardService) -> None:
+        """Verify re-ingesting the exact same file produces stable source_id and observation_ids."""
+        sample_path = Path(__file__).parent.parent / "data" / "sample" / "events.json"
+        if not sample_path.exists():
+            pytest.skip("Sample data not available")
+
+        content = sample_path.read_bytes()
+        res1 = dashboard_service.ingest_and_process_uploads(
+            uploads=[("events.json", content)],
+            enable_resolution=True,
+            persist_db=False,
+        )
+        res2 = dashboard_service.ingest_and_process_uploads(
+            uploads=[("events.json", content)],
+            enable_resolution=True,
+            persist_db=False,
+        )
+
+        obs1_ids = [o.observation_id for o in res1["observations"]]
+        obs2_ids = [o.observation_id for o in res2["observations"]]
+        assert obs1_ids == obs2_ids
+
+        src1_ids = [r.source_record.source_id for r in res1["ingestion_results"]]
+        src2_ids = [r.source_record.source_id for r in res2["ingestion_results"]]
+        assert src1_ids == src2_ids
+
+    def test_ingest_and_process_uploads_sqlite_persistence_and_reload(
+        self, in_memory_factory: sessionmaker
+    ) -> None:
+        """Verify uploaded files and observations persist to database and reload in fresh session."""
+        sample_path = Path(__file__).parent.parent / "data" / "sample" / "events.json"
+        if not sample_path.exists():
+            pytest.skip("Sample data not available")
+
+        settings = Settings(database_url="sqlite:///:memory:")
+        service = DashboardService(settings=settings, session_factory=in_memory_factory)
+
+        content = sample_path.read_bytes()
+        res = service.ingest_and_process_uploads(
+            uploads=[("events.json", content)],
+            enable_resolution=True,
+            persist_db=True,
+        )
+
+        assert res["persistence_mode"] == "postgresql" or res["persistence_mode"] == "in_memory"
+        # Verify records reload in fresh repository query
+        from sqlalchemy import select
+        from beacon.storage import SourceModel, ObservationModel, get_session
+        with get_session(in_memory_factory) as session:
+            sources = session.execute(select(SourceModel)).scalars().all()
+            assert len(sources) >= 1
+            observations = session.execute(select(ObservationModel)).scalars().all()
+            assert len(observations) >= 1
+
+    def test_render_process_timeline_component(self) -> None:
+        """Verify render_process_timeline executes cleanly without exception."""
+        from beacon.dashboard.components import render_process_timeline
+
+        stages = [
+            {"stage_id": "s1", "name": "Step 1", "status": "completed", "message": "Success", "counts": {"n": 5}},
+            {"stage_id": "s2", "name": "Step 2", "status": "warning", "message": "Notice", "counts": {"warn": 1}},
+            {"stage_id": "s3", "name": "Step 3", "status": "failed", "message": "Error", "counts": {"fail": 1}},
+        ]
+        # Calling in test environment without exception
+        render_process_timeline(stages, title="Test Timeline")
+
+    def test_render_observation_cards_component(self, sample_events: list[UnifiedDisasterEvent]) -> None:
+        """Verify render_observation_cards renders complete, unanchored, and ambiguous observations."""
+        from beacon.dashboard.components import render_observation_cards
+
+        obs1 = DisasterObservation(
+            observation_id="obs_card_01",
+            source_id="src_01",
+            event_type="flood",
+            location="Riverside Center",
+            event_time=datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc),
+            latitude=34.05,
+            longitude=-118.25,
+            severity="critical",
+            raw_claim="River cresting at 14ft",
+            validation_warnings=["Temporal confidence is approximate"],
+        )
+        obs2 = DisasterObservation(
+            observation_id="obs_card_02",
+            source_id="src_02",
+            event_type="wildfire",
+            location="Pine Valley",
+            event_time=None,  # Explicit unanchored temporal reference
+            latitude=None,
+            longitude=None,
+            severity=None,
+            raw_claim="Smoke plume sighted in valley",
+        )
+
+        ev_map = {"obs_card_01": "evt_dash_01"}
+        dec_map = {
+            "obs_card_02": {
+                "decision_type": "ambiguous_candidate",
+                "composite_score": 0.58,
+                "rationale": "Multiple spatial matches detected within 15km",
+            }
+        }
+
+        render_observation_cards([obs1, obs2], event_map=ev_map, resolution_decisions=dec_map)
+
+    def test_beam_particles_definitions_and_reduced_motion(self) -> None:
+        """Verify expanded particle CSS motes m1..m16 and reduced-motion safety."""
+        from beacon.dashboard.components import DASHBOARD_CSS, get_minecraft_beacon_svg
+
+        # Verify full suite of motes m1 through m16
+        for i in range(1, 17):
+            assert f".beacon-beam-mote.m{i}" in DASHBOARD_CSS
+
+        # Verify keyframes
+        assert "@keyframes beacon-full-mote" in DASHBOARD_CSS
+        assert "@keyframes beacon-mote-mid" in DASHBOARD_CSS
+        assert "@keyframes beacon-mote-upper" in DASHBOARD_CSS
+
+        # Verify reduced motion suppresses particles
+        assert "@media (prefers-reduced-motion: reduce)" in DASHBOARD_CSS
+        assert ".beacon-beam-mote" in DASHBOARD_CSS
+
+        # Verify SVG contains middle and upper ascending particles
+        svg = get_minecraft_beacon_svg()
+        assert "beacon-particle-1" in svg
+        assert "beacon-particle-2" in svg
+        assert 'y="-140"' in svg
+        assert 'y="-600"' in svg
+
+    def test_render_pipeline_timeline_timing_and_presentation(self) -> None:
+        """Verify render_pipeline_timeline accepts monotonic execution timing and animates without error."""
+        from unittest.mock import MagicMock
+        from beacon.dashboard.components import render_pipeline_timeline
+
+        mock_result = MagicMock()
+        mock_result.execution_id = "test_run_exec_01"
+        mock_result.files_discovered = 5
+        mock_result.files_succeeded = 5
+        mock_result.files_failed = 0
+        mock_result.observations_extracted = 12
+        mock_result.observations_transformed = 12
+        mock_result.observations_accepted = 12
+        mock_result.observations_rejected = 0
+        mock_result.events_synthesized = 8
+        mock_result.resolution_summary = {"ambiguous_count": 0}
+        mock_result.storage_enabled = True
+        mock_result.records_persisted = 12
+        mock_result.events_persisted = 8
+        mock_result.duration_seconds = 0.04
+        mock_result.errors = []
+
+        # Instantaneous mode
+        render_pipeline_timeline(mock_result, measured_exec_time=0.035, animate=False, min_presentation_seconds=4.0)
+
+        # Progressive animation mode (with low duration for fast test execution)
+        render_pipeline_timeline(mock_result, measured_exec_time=0.035, animate=True, min_presentation_seconds=0.05)

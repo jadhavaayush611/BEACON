@@ -87,3 +87,85 @@ class TestInitDbSafety:
             assert ret == 1
             captured = capsys.readouterr()
             assert "ERROR: No database URL configured" in captured.err
+
+    def test_init_db_creates_all_eight_tables_and_readiness_reports_healthy(self, test_db_path: str) -> None:
+        """Verify init_db creates all 8 required tables (including pipeline_runs) and readiness is healthy."""
+        from sqlalchemy import create_engine, inspect
+        from beacon.config import Settings
+        from beacon.dashboard.services import REQUIRED_TABLES, DashboardService
+
+        ret = init_db_script.main(["--url", test_db_path])
+        assert ret == 0
+
+        engine = create_engine(test_db_path)
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        assert len(tables) == 8
+        for tbl in REQUIRED_TABLES:
+            assert tbl in tables, f"Expected table '{tbl}' was not created by init_db."
+
+        service = DashboardService(settings=Settings(database_url=test_db_path))
+        diag = service.test_database_connection()
+        assert diag["connected"] is True
+        assert diag["schema_ready"] is True
+        assert diag["status"] == "healthy"
+        assert diag["ready_tables"] == 8
+        assert diag["total_tables"] == 8
+        assert diag["tables"]["pipeline_runs"] >= 0
+
+    def test_schema_readiness_detects_missing_pipeline_runs_table(self, test_db_path: str) -> None:
+        """Verify readiness check detects when pipeline_runs is missing and flags schema as uninitialized."""
+        from sqlalchemy import create_engine, text
+        from beacon.config import Settings
+        from beacon.dashboard.services import DashboardService
+
+        # Initialize complete schema
+        assert init_db_script.main(["--url", test_db_path]) == 0
+
+        # Drop only pipeline_runs to simulate legacy / incomplete schema
+        engine = create_engine(test_db_path)
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE pipeline_runs;"))
+
+        service = DashboardService(settings=Settings(database_url=test_db_path))
+        diag = service.test_database_connection()
+        assert diag["connected"] is True
+        assert diag["schema_ready"] is False
+        assert diag["status"] == "uninitialized"
+        assert "pipeline_runs" in diag["message"]
+        assert diag["tables"]["pipeline_runs"] == -1
+        assert diag["ready_tables"] == 7
+        assert diag["total_tables"] == 8
+
+    def test_migrate_v1_0_script_upgrades_schema(self, test_db_path: str, capsys) -> None:
+        """Verify scripts/migrate_v1_0.py adds pipeline_runs to a 7-table schema and restores readiness."""
+        import scripts.migrate_v1_0 as migrate_script
+        from sqlalchemy import create_engine, inspect, text
+        from beacon.config import Settings
+        from beacon.dashboard.services import DashboardService
+
+        # Initialize complete schema then drop pipeline_runs
+        init_db_script.main(["--url", test_db_path])
+        engine = create_engine(test_db_path)
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE pipeline_runs;"))
+
+        # 1. Test dry-run
+        ret_dry = migrate_script.main(["--url", test_db_path, "--dry-run"])
+        assert ret_dry == 0
+        captured = capsys.readouterr()
+        assert "Dry-run: v1.0 Migration DDL" in captured.out
+        # Still 7 tables
+        assert "pipeline_runs" not in inspect(engine).get_table_names()
+
+        # 2. Test actual migration
+        ret_mig = migrate_script.main(["--url", test_db_path])
+        assert ret_mig == 0
+        assert "pipeline_runs" in inspect(engine).get_table_names()
+
+        # Readiness should now be healthy
+        service = DashboardService(settings=Settings(database_url=test_db_path))
+        diag = service.test_database_connection()
+        assert diag["schema_ready"] is True
+        assert diag["status"] == "healthy"
+        assert diag["ready_tables"] == 8

@@ -131,3 +131,21 @@ CREATE TABLE IF NOT EXISTS merge_candidates (
 CREATE INDEX IF NOT EXISTS idx_merge_primary_event ON merge_candidates (primary_event_id);
 CREATE INDEX IF NOT EXISTS idx_merge_secondary_event ON merge_candidates (secondary_event_id);
 CREATE INDEX IF NOT EXISTS idx_merge_status ON merge_candidates (status);
+-- 8. Pipeline Run Execution History & Telemetry Table
+CREATE TABLE IF NOT EXISTS pipeline_runs (
+    run_id VARCHAR(64) PRIMARY KEY,
+    status VARCHAR(32) NOT NULL,
+    started_at TIMESTAMP WITH TIME ZONE NOT NULL,
+    completed_at TIMESTAMP WITH TIME ZONE,
+    duration_seconds DOUBLE PRECISION,
+    trigger_type VARCHAR(32) NOT NULL DEFAULT 'manual',
+    retry_of_run_id VARCHAR(64) REFERENCES pipeline_runs(run_id) ON DELETE SET NULL,
+    inputs_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    counts_summary JSONB NOT NULL DEFAULT '{}'::jsonb,
+    failure_details JSONB NOT NULL DEFAULT '[]'::jsonb,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_status ON pipeline_runs (status);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_started ON pipeline_runs (started_at);
+CREATE INDEX IF NOT EXISTS idx_pipeline_runs_retry ON pipeline_runs (retry_of_run_id);

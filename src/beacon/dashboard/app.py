@@ -5,6 +5,7 @@ Command Center Edition: "One event, many sources, one trusted data profile."
 
 from datetime import datetime, timezone
 from pathlib import Path
+import time
 import pandas as pd
 import streamlit as st
 
@@ -12,9 +13,13 @@ from beacon.analytics.models import AnalyticsFilter
 from beacon.config import get_settings
 from beacon.dashboard.components import (
     extract_geographic_dataframe,
+    get_minecraft_beacon_svg,
     get_system_status_pill_html,
     inject_custom_styles,
     render_empty_state,
+    render_observation_cards,
+    render_pipeline_timeline,
+    render_process_timeline,
 )
 from beacon.dashboard.formatters import (
     explain_compression_ratio,
@@ -53,48 +58,54 @@ def get_service() -> DashboardService:
 service = get_service()
 db_status = service.test_database_connection()
 
-# Sidebar: System Status & Architecture
-st.sidebar.title("🚨 BEACON System")
-st.sidebar.caption("v1.0.0 — Multi-Format Disaster Intelligence")
-
-if db_status.get("schema_ready"):
-    st.sidebar.success("🟢 Storage: PostgreSQL Online")
-    total_tbls = db_status.get("total_tables") or len(db_status.get("tables", {})) or len(REQUIRED_TABLES)
-    ready_tbls = db_status.get("ready_tables") or sum(1 for c in db_status.get("tables", {}).values() if c >= 0)
-    st.sidebar.caption(f"Relational schemas initialized and verified ({ready_tbls}/{total_tbls} tables online).")
-elif db_status.get("connected"):
-    st.sidebar.warning("🟡 Storage: PostgreSQL Connected (Uninitialized)")
-    st.sidebar.caption(redact_sensitive_text(db_status.get("message", "Schema uninitialized.")))
-else:
-    st.sidebar.warning("🟡 Storage: In-Memory Mode (Stateless)")
-    st.sidebar.caption(
-        redact_sensitive_text(
-            db_status.get("message", "BEACON_DATABASE_URL is not set. Running in-memory mode.")
-        )
+# ==============================================================================
+# Sidebar: Minimal 8-Bit Minecraft-Beacon Project Identity
+# Contains ONLY: The animated pixel-art beacon logo and the project name BEACON,
+# positioned cohesively at the bottom with clean negative space above.
+# ==============================================================================
+with st.sidebar:
+    st.markdown(
+        f'<div class="beacon-sidebar-full-container">'
+        f'<div class="beacon-sidebar-full-beam">'
+        f'  <div class="beacon-beam-glow"></div>'
+        f'  <div class="beacon-beam-mid"></div>'
+        f'  <div class="beacon-beam-core"></div>'
+        f'  <div class="beacon-beam-laser"></div>'
+        f'  <div class="beacon-beam-mote m1"></div>'
+        f'  <div class="beacon-beam-mote m2"></div>'
+        f'  <div class="beacon-beam-mote m3"></div>'
+        f'  <div class="beacon-beam-mote m4"></div>'
+        f'  <div class="beacon-beam-mote m5"></div>'
+        f'  <div class="beacon-beam-mote m6"></div>'
+        f'  <div class="beacon-beam-mote m7"></div>'
+        f'  <div class="beacon-beam-mote m8"></div>'
+        f'  <div class="beacon-beam-mote m9"></div>'
+        f'  <div class="beacon-beam-mote m10"></div>'
+        f'  <div class="beacon-beam-mote m11"></div>'
+        f'  <div class="beacon-beam-mote m12"></div>'
+        f'  <div class="beacon-beam-mote m13"></div>'
+        f'  <div class="beacon-beam-mote m14"></div>'
+        f'  <div class="beacon-beam-mote m15"></div>'
+        f'  <div class="beacon-beam-mote m16"></div>'
+        f'</div>'
+        f'<div class="beacon-sidebar-footer">'
+        f'  {get_minecraft_beacon_svg()}'
+        f'  <div class="beacon-sidebar-wordmark">BEACON</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
     )
-
-st.sidebar.caption(
-    "🔒 **Security Posture:** Connection endpoints and credentials are redacted in compliance with the Command Center security specification."
-)
-
-st.sidebar.markdown("---")
-st.sidebar.markdown(
-    """
-    **Architecture Principles:**
-    - Heterogeneous Ingestion
-    - Non-Fabrication Guarantee
-    - Explicit Conflict Tracking
-    - Spatiotemporal Clustered Matching
-    - Explainable Resolution Lineage
-    """
-)
 
 # Command Center Header
 col_hdr_title, col_hdr_status = st.columns([3, 1])
 with col_hdr_title:
     st.markdown(
-        '<div class="beacon-title">🚨 BEACON COMMAND CENTER</div>'
-        '<div class="beacon-subtitle">Operational Disaster Intelligence & Canonical Entity Resolution Platform</div>',
+        '''
+        <div class="beacon-header">
+            <div class="beacon-title">⚡ BEACON COMMAND CENTER</div>
+            <div class="beacon-subtitle">DISASTER INTELLIGENCE PIPELINE</div>
+        </div>
+        ''',
         unsafe_allow_html=True,
     )
     st.caption("> *\"One event, many sources, one trusted data profile.\"*")
@@ -110,6 +121,21 @@ with col_hdr_status:
         f'<div style="text-align: right; font-size: 0.75rem; color: #64748b; margin-top: 0.25rem;">{utc_now}</div>',
         unsafe_allow_html=True,
     )
+
+# System Operational Banner (State Notification outside Sidebar)
+if not db_status.get("schema_ready"):
+    if db_status.get("connected"):
+        st.warning(
+            "🟡 Storage: PostgreSQL Connected (Uninitialized) — "
+            + redact_sensitive_text(db_status.get("message", "Schema uninitialized. Run scripts/init_db.py."))
+        )
+    else:
+        st.warning(
+            "🟡 Storage: In-Memory Mode (Stateless) — "
+            + redact_sensitive_text(
+                db_status.get("message", "BEACON_DATABASE_URL is not set. Running in-memory mode.")
+            )
+        )
 
 # Navigation Tabs
 tab_overview, tab_ingest, tab_pipeline, tab_events, tab_analytics, tab_diagnostics = st.tabs([
@@ -146,24 +172,28 @@ with tab_overview:
     # Four Command Center KPI Cards
     c1, c2, c3, c4 = st.columns(4)
     with c1:
+        st.markdown('<div class="kpi-tag kpi-tag-cyan">💎 EVENT CORES</div>', unsafe_allow_html=True)
         st.metric(
             label="Unified Events",
             value=total_ev,
             help="Total canonical disaster profiles synthesized across all ingested observations",
         )
     with c2:
+        st.markdown('<div class="kpi-tag kpi-tag-emerald">📜 INGESTED FEEDS</div>', unsafe_allow_html=True)
         st.metric(
             label="Constituent Observations",
             value=total_obs,
             help="Total normalized observations extracted across all ingested reporting channels",
         )
     with c3:
+        st.markdown('<div class="kpi-tag kpi-tag-purple">📡 DATA CHANNELS</div>', unsafe_allow_html=True)
         st.metric(
             label="Contributing Sources",
             value=total_src,
             help="Distinct files or sensor streams successfully ingested into the pipeline",
         )
     with c4:
+        st.markdown('<div class="kpi-tag kpi-tag-amber">⚡ CONSOLIDATION</div>', unsafe_allow_html=True)
         st.metric(
             label="Compression Ratio",
             value=format_compression_ratio(comp_ratio),
@@ -285,32 +315,93 @@ with tab_ingest:
     )
 
     if uploaded_files:
-        st.write(f"Selected **{len(uploaded_files)}** file(s).")
-        if st.button("Ingest Uploaded Files", type="primary"):
+        st.write(f"📁 Selected **{len(uploaded_files)}** file(s): " + ", ".join(f"`{f.name}` ({f.size} B)" for f in uploaded_files))
+
+    col_opt1, col_opt2 = st.columns(2)
+    with col_opt1:
+        ingest_resolve = st.checkbox("Execute Event Matching & Synthesis", value=True, key="ingest_res_opt")
+    with col_opt2:
+        ingest_persist = st.checkbox(
+            "Persist observations & events to database",
+            value=service.is_database_connected,
+            disabled=not service.is_database_connected,
+            key="ingest_persist_opt",
+        )
+        if not service.is_database_connected:
+            st.caption("🟡 Storage unconfigured or schema incomplete: Ingestion will run in stateless in-memory mode.")
+
+    btn_ingest_files = st.button("📥 Ingest Uploaded Files", type="primary", key="btn_ingest_files")
+
+    if btn_ingest_files:
+        if not uploaded_files:
+            st.warning("⚠️ No files selected. Please upload or select one or more disaster intelligence files above before ingesting.")
+        else:
             file_tuples = [(f.name, f.getvalue()) for f in uploaded_files]
-            with st.spinner("Ingesting and validating files..."):
-                results, _ = service.process_uploaded_files(file_tuples, cleanup=True)
+            with st.spinner("Executing multi-stage ingestion pipeline..."):
+                ingest_data = service.ingest_and_process_uploads(
+                    file_tuples,
+                    enable_resolution=ingest_resolve,
+                    persist_db=ingest_persist,
+                )
+                st.session_state["last_ingestion_data"] = ingest_data
 
-            st.success(f"Successfully processed {len(results)} file(s).")
+    # Persist and render ingestion results across Streamlit reruns
+    ingest_data = st.session_state.get("last_ingestion_data")
+    if ingest_data:
+        # 1. Real-time Ingestion Process Timeline
+        render_process_timeline(ingest_data["stages"], title="Ingestion Process Timeline")
 
+        # 2. File Status Summary Table
+        results = ingest_data.get("ingestion_results", [])
+        if results:
             rows = []
             for r in results:
                 rows.append({
                     "Filename": Path(r.source_record.source_file).name,
-                    "Type": r.source_record.source_type.value,
-                    "Status": r.status.value,
+                    "Type": r.source_record.source_type.value.upper(),
+                    "Status": r.status.value.upper(),
                     "Observations Extracted": len(r.observations),
                     "Errors": len(r.errors),
                     "Warnings": len(r.warnings),
                 })
+            st.subheader("Ingestion Results per File")
             st.dataframe(rows, width="stretch")
 
-            with st.expander("View Extracted Observations"):
-                all_obs = [o.model_dump(mode="json") for r in results for o in r.observations]
-                if all_obs:
-                    st.json(all_obs[:10])
-                else:
-                    st.write("No observations extracted from uploaded files.")
+        # 3. Batch Analytics KPI Metrics
+        obs = ingest_data.get("observations", [])
+        evts = ingest_data.get("events", [])
+        k1, k2, k3, k4 = st.columns(4)
+        with k1:
+            st.metric("Files Processed", len(results))
+        with k2:
+            st.metric("Observations Extracted", len(obs))
+        with k3:
+            qr = ingest_data.get("quality_report")
+            pass_rate = f"{(qr.passed_count / max(1, qr.passed_count + qr.failed_count)) * 100:.0f}%" if qr else "100%"
+            st.metric("Quality Audit Pass Rate", pass_rate)
+        with k4:
+            st.metric("Canonical Events Active", len(evts))
+
+        # 4. Unified Presentation of Newly Ingested Observations & Canonical Event Profiles
+        st.markdown("---")
+        st.subheader("📋 Extracted Disaster Observations & Canonical Profiles")
+        st.caption("Individual incident claims synthesized across reporting channels with complete audit lineage.")
+
+        # Build event and decision maps for rich observation cards
+        ev_map = {}
+        for e in evts:
+            for oid in e.observation_ids:
+                ev_map[oid] = e.event_id
+
+        dec_map = {}
+        for out in ingest_data.get("resolution_outcomes", []):
+            dec_map[out.observation_id] = {
+                "decision_type": getattr(out.decision, "value", str(out.decision)),
+                "composite_score": out.score,
+                "rationale": out.rationale,
+            }
+
+        render_observation_cards(obs, event_map=ev_map, resolution_decisions=dec_map)
 
     st.markdown("---")
 
@@ -398,12 +489,13 @@ with tab_pipeline:
         "Execute the full pipeline: **Extract ➔ Transform ➔ Validate (Data Quality) ➔ Resolve ➔ Load (PostgreSQL)**."
     )
 
+    repo_root = Path(__file__).resolve().parent.parent.parent.parent
     sample_paths = [
-        Path("data/sample/events.json"),
-        Path("data/sample/events.csv"),
-        Path("data/sample/events.txt"),
-        Path("data/sample/sample_report.pdf"),
-        Path("data/sample/sample_disaster.png"),
+        repo_root / "data" / "sample" / "events.json",
+        repo_root / "data" / "sample" / "events.csv",
+        repo_root / "data" / "sample" / "events.txt",
+        repo_root / "data" / "sample" / "sample_report.pdf",
+        repo_root / "data" / "sample" / "sample_disaster.png",
     ]
     existing_samples = [p for p in sample_paths if p.exists()]
 
@@ -424,19 +516,23 @@ with tab_pipeline:
         # Clear prior execution result and errors to prevent stale metrics on failure
         st.session_state["last_pipeline_result"] = None
         st.session_state["last_pipeline_error"] = None
+        st.session_state["last_pipeline_exec_time"] = None
+        st.session_state["animate_pipeline_run_id"] = None
 
         with st.spinner("Executing BEACON ETL and Resolution Pipeline..."):
             try:
+                t0 = time.perf_counter()
                 result = service.run_pipeline_on_paths(
                     existing_samples,
                     enable_resolution=resolution_option,
                     persist_db=persist_option,
                 )
+                measured_exec_time = time.perf_counter() - t0
                 st.session_state["last_pipeline_result"] = result
-                st.rerun()
+                st.session_state["last_pipeline_exec_time"] = measured_exec_time
+                st.session_state["animate_pipeline_run_id"] = result.execution_id
             except Exception as ex:
                 st.session_state["last_pipeline_error"] = redact_sensitive_text(str(ex))
-                st.rerun()
 
     # Display error from latest run if execution failed
     last_error = st.session_state.get("last_pipeline_error")
@@ -447,6 +543,18 @@ with tab_pipeline:
     last_result = st.session_state.get("last_pipeline_result")
     if last_result is not None:
         st.success(f"Pipeline Run `{last_result.execution_id}` Complete!")
+
+        # 5-Stage Real-Time Pipeline Execution Timeline with monotonic execution timing
+        should_animate = st.session_state.get("animate_pipeline_run_id") == last_result.execution_id
+        measured_exec_time = st.session_state.get("last_pipeline_exec_time")
+        render_pipeline_timeline(
+            last_result,
+            measured_exec_time=measured_exec_time,
+            animate=should_animate,
+            min_presentation_seconds=4.0,
+        )
+        if should_animate:
+            st.session_state["animate_pipeline_run_id"] = None
 
         # Results metrics
         m1, m2, m3, m4, m5 = st.columns(5)
@@ -760,6 +868,7 @@ with tab_analytics:
                 df_types,
                 x="Disaster Type",
                 y="Event Count",
+                color="#00f0ff",
                 horizontal=True,
                 x_label="Event Count",
                 y_label="Disaster Type",
@@ -784,6 +893,7 @@ with tab_analytics:
                 df_sev,
                 x="Severity Level",
                 y="Event Count",
+                color="#38bdf8",
                 horizontal=True,
                 x_label="Event Count",
                 y_label="Severity Level",
@@ -806,6 +916,7 @@ with tab_analytics:
             corrob_df,
             x="Classification",
             y="Count",
+            color="#10b981",
             horizontal=True,
             x_label="Event Count",
             y_label="Classification",
@@ -826,6 +937,7 @@ with tab_analytics:
                 df_conf,
                 x="Field Name",
                 y="Conflicting Claims",
+                color="#ef4444",
                 horizontal=True,
                 x_label="Conflicting Claims",
                 y_label="Field Name",
@@ -859,6 +971,7 @@ with tab_analytics:
                 timeline_df,
                 x="Incident Date",
                 y="Events Active",
+                color="#a855f7",
                 x_label="Incident Date",
                 y_label="Events Active",
             )
@@ -918,7 +1031,7 @@ with tab_diagnostics:
         st.success(f"Database Engine Status: {status_str} — Relational Persistence Online")
         st.subheader("Relational Tables Integrity & Row Counts")
         t_data = [
-            {"Table": k, "Status": "Ready", "Row Count": v if v >= 0 else 0}
+            {"Table": k, "Status": "Ready", "Row Count": str(v) if v >= 0 else "0"}
             for k, v in diag.get("tables", {}).items()
         ]
         st.table(t_data)
@@ -931,7 +1044,7 @@ with tab_diagnostics:
             {
                 "Table": k,
                 "Status": "Ready" if v >= 0 else "Missing",
-                "Row Count": v if v >= 0 else "—",
+                "Row Count": str(v) if v >= 0 else "—",
             }
             for k, v in diag.get("tables", {}).items()
         ]
