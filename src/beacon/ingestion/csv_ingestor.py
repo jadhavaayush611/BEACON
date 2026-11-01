@@ -12,6 +12,7 @@ from beacon.ingestion.result import IngestionResult
 from beacon.models import (
     DisasterObservation,
     ExtractionMethod,
+    ExtractionOutcome,
     ExtractionStatus,
     SourceType,
     generate_observation_id,
@@ -44,6 +45,8 @@ class CsvIngestor(BaseIngestor):
                     source_record=source_rec,
                     observations=[],
                     status=ExtractionStatus.SUCCESS,
+                    outcome=ExtractionOutcome.DOCUMENT_ANALYZED_NO_OBSERVATIONS,
+                    explanation=f"CSV file '{path.name}' is empty or contains no rows.",
                     errors=[],
                     warnings=[f"CSV file '{path.name}' is empty or contains no rows."],
                     processed_count=0,
@@ -65,6 +68,8 @@ class CsvIngestor(BaseIngestor):
             return IngestionResult(
                 source_record=source_rec,
                 status=ExtractionStatus.FAILED,
+                outcome=ExtractionOutcome.EXTRACTION_FAILED,
+                explanation=err_msg,
                 errors=[err_msg],
                 processed_count=0,
                 accepted_count=0,
@@ -82,6 +87,8 @@ class CsvIngestor(BaseIngestor):
             return IngestionResult(
                 source_record=source_rec,
                 status=ExtractionStatus.FAILED,
+                outcome=ExtractionOutcome.EXTRACTION_FAILED,
+                explanation=err_msg,
                 errors=[err_msg],
             )
 
@@ -209,16 +216,24 @@ class CsvIngestor(BaseIngestor):
         # Determine extraction status
         if processed_count == 0:
             status = ExtractionStatus.SUCCESS
+            outcome = ExtractionOutcome.DOCUMENT_ANALYZED_NO_OBSERVATIONS
+            explanation = "CSV contains zero data rows."
         elif accepted_count > 0 and rejected_count == 0:
             status = ExtractionStatus.SUCCESS
+            outcome = ExtractionOutcome.OBSERVATIONS_EXTRACTED
+            explanation = f"Successfully extracted {accepted_count} canonical disaster observation(s) from {processed_count} CSV row(s)."
         elif accepted_count > 0 and rejected_count > 0:
             status = ExtractionStatus.PARTIAL
+            outcome = ExtractionOutcome.OBSERVATIONS_EXTRACTED
+            explanation = f"Partial extraction: {accepted_count} of {processed_count} rows accepted, {rejected_count} rejected."
             warnings.append(
                 f"Partial ingestion: {accepted_count} of {processed_count} rows accepted, "
                 f"{rejected_count} rejected due to errors."
             )
         else:
             status = ExtractionStatus.FAILED
+            outcome = ExtractionOutcome.EXTRACTION_FAILED
+            explanation = f"All {processed_count} CSV rows failed validation."
             errors.append(f"All {processed_count} CSV rows failed validation.")
 
         source_rec.extraction_status = status
@@ -229,6 +244,8 @@ class CsvIngestor(BaseIngestor):
             source_record=source_rec,
             observations=observations,
             status=status,
+            outcome=outcome,
+            explanation=explanation,
             errors=errors,
             warnings=warnings,
             processed_count=processed_count,

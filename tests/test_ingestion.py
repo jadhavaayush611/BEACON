@@ -347,8 +347,9 @@ class TestTxtIngestion:
 
         res = ingest_file(unstructured_file)
         assert res.status == ExtractionStatus.SUCCESS
-        assert res.processed_count == 0
-        assert len(res.observations) == 0
+        assert res.processed_count == 1
+        assert len(res.observations) == 1
+        assert res.observations[0].observation_type.value == "document_context"
         assert any("No structured [REPORT ...] incident blocks" in w for w in res.warnings)
 
     def test_invalid_utf8_txt_fails(self, tmp_path: Path) -> None:
@@ -523,7 +524,8 @@ class TestImageIngestion:
     def test_sample_disaster_png_ingestion(self) -> None:
         res = ingest_file(SAMPLE_DIR / "sample_disaster.png")
         assert res.status == ExtractionStatus.SUCCESS
-        assert len(res.observations) == 0  # No OCR inference in Phase 2
+        assert len(res.observations) == 1  # 1 IMAGE_CONTEXT observation
+        assert res.observations[0].observation_type.value == "image_context"
         assert res.source_record.source_type == SourceType.IMAGE
         assert res.source_record.metadata["width"] == 240
         assert res.source_record.metadata["height"] == 160
@@ -632,17 +634,13 @@ class TestFullFormatTraceabilityAndLineage:
                 # Persist source record
                 repo.save_source(res.source_record, session)
 
-                if file_path.suffix == ".png":
-                    assert len(res.observations) == 0
-                    assert any("semantic disaster extraction deferred to OCR" in w for w in res.warnings)
-                else:
-                    assert len(res.observations) > 0
-                    transformed = transformer.transform_batch(res.observations)
-                    quality_report = validator.validate(transformed)
+                assert len(res.observations) > 0
+                transformed = transformer.transform_batch(res.observations)
+                quality_report = validator.validate(transformed)
 
-                    repo.save_observations(transformed, session)
-                    repo.save_quality_results(quality_report.outcomes, session)
-                    all_observations.extend(transformed)
+                repo.save_observations(transformed, session)
+                repo.save_quality_results(quality_report.outcomes, session)
+                all_observations.extend(transformed)
 
             session.commit()
 
@@ -657,7 +655,8 @@ class TestFullFormatTraceabilityAndLineage:
             assert len(obs_in_db) == len(all_observations)
             for db_obs in obs_in_db:
                 assert db_obs.source_id in {s.source_id for s in sources_in_db}
-                assert db_obs.event_type is not None
+                if db_obs.is_event_eligible:
+                    assert db_obs.event_type is not None
                 assert db_obs.raw_claim is not None
 
             # Resolve observations
@@ -701,3 +700,104 @@ class TestFullFormatTraceabilityAndLineage:
                 }
                 if decision.event_id is not None:
                     assert decision.event_id in event_ids
+
+
+# ==============================================================================
+# 9. Document-Aware Ingestion Tests
+# ==============================================================================
+
+class TestDocumentAwareIngestion:
+    """Validate document-aware ingestion for manifests, README docs, and non-incident files."""
+
+    def test_json_manifest_extraction(self, tmp_path: Path) -> None:
+        manifest_file = tmp_path / "manifest.json"
+        manifest_file.write_text(
+            json.dumps({
+                "dataset_name": "Test Simulation Pack",
+                "dataset_version": "2.0.0",
+                "dataset_description": "Synthetic multi-format test pack",
+                "disclaimer": "ALL CONTENT IS SYNTHETIC.",
+                "files": [
+                    {"file": "events.json", "format": "JSON", "purpose": "Structured events"},
+                    {"file": "events.csv", "format": "CSV", "purpose": "Tabular records"},
+                ],
+            }),
+            encoding="utf-8",
+        )
+
+        ingestor = JsonIngestor()
+        result = ingestor.ingest(manifest_file)
+
+        assert result.status == ExtractionStatus.SUCCESS
+        assert result.outcome.value == "metadata_extracted"
+        assert len(result.observations) == 1
+        assert result.observations[0].observation_type.value == "dataset_metadata"
+        assert result.document_metadata is not None
+        assert result.document_metadata["dataset_name"] == "Test Simulation Pack"
+        assert result.document_metadata["version"] == "2.0.0"
+        assert result.document_metadata["inventory_count"] == 2
+        assert "events.json" in result.document_metadata["referenced_files"]
+        assert result.source_record.extraction_status == ExtractionStatus.SUCCESS
+        assert result.source_record.metadata.get("document_type") == "dataset_manifest"
+
+    def test_txt_documentation_extraction(self, tmp_path: Path) -> None:
+        readme_file = tmp_path / "README_DEMO.txt"
+        readme_file.write_text(
+            "BEACON DEMO DOCUMENTATION\n"
+            "=========================\n\n"
+            "IMPORTANT: ALL DATA IS SYNTHETIC TEST DATA.\n\n"
+            "Section 1: Overview\n"
+            "-------------------\n"
+            "This package contains events.json, events.csv, and sample_report.pdf.\n\n"
+            "Section 2: Usage Instructions:\n"
+            "Upload files through the dashboard.\n",
+            encoding="utf-8",
+        )
+
+        ingestor = TxtIngestor()
+        result = ingestor.ingest(readme_file)
+
+        assert result.status == ExtractionStatus.SUCCESS
+        assert result.outcome.value == "document_analyzed_no_observations"
+        assert len(result.observations) == 1
+        assert result.observations[0].observation_type.value == "document_context"
+        assert result.document_metadata is not None
+        assert result.document_metadata["document_title"] == "BEACON DEMO DOCUMENTATION"
+        assert "events.json" in result.document_metadata["referenced_files"]
+        assert "events.csv" in result.document_metadata["referenced_files"]
+        assert "sample_report.pdf" in result.document_metadata["referenced_files"]
+        assert result.source_record.extraction_status == ExtractionStatus.SUCCESS
+
+    def test_malformed_json_fails_gracefully(self, tmp_path: Path) -> None:
+        bad_json = tmp_path / "corrupt.json"
+        bad_json.write_text("{ unquoted_key: 123, }", encoding="utf-8")
+
+        ingestor = JsonIngestor()
+        result = ingestor.ingest(bad_json)
+
+        assert result.status == ExtractionStatus.FAILED
+        assert result.outcome.value == "extraction_failed"
+        assert len(result.observations) == 0
+        assert len(result.errors) > 0
+        assert "JSON syntax" in result.errors[0] or "Malformed" in result.errors[0]
+
+    def test_empty_files_handled_honestly(self, tmp_path: Path) -> None:
+        empty_txt = tmp_path / "empty.txt"
+        empty_txt.write_text("   \n\n  ", encoding="utf-8")
+        res_txt = TxtIngestor().ingest(empty_txt)
+        assert res_txt.status == ExtractionStatus.SUCCESS
+        assert res_txt.outcome.value == "document_analyzed_no_observations"
+        assert len(res_txt.observations) == 0
+
+        empty_csv = tmp_path / "empty.csv"
+        empty_csv.write_text("", encoding="utf-8")
+        res_csv = CsvIngestor().ingest(empty_csv)
+        assert res_csv.status == ExtractionStatus.SUCCESS
+        assert res_csv.outcome.value == "document_analyzed_no_observations"
+        assert len(res_csv.observations) == 0
+
+        empty_json = tmp_path / "empty.json"
+        empty_json.write_text("", encoding="utf-8")
+        res_json = JsonIngestor().ingest(empty_json)
+        assert res_json.status == ExtractionStatus.FAILED
+        assert res_json.outcome.value == "extraction_failed"

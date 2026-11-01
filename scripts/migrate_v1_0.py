@@ -12,7 +12,7 @@ from typing import Optional, Sequence
 from sqlalchemy import text
 
 from beacon.config import get_settings
-from beacon.logging_config import setup_logging
+from beacon.logging_config import redact_sensitive_text, setup_logging
 from beacon.storage import create_db_engine
 
 MIGRATION_SQL_PATH = (
@@ -79,12 +79,13 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     try:
         engine = create_db_engine(url)
-        print(f"Applying v1.0 migration to {engine.url} ...")
+        safe_url = redact_sensitive_text(str(engine.url))
+        print(f"Applying v1.0 migration to {safe_url} ...")
         apply_migration(engine, dry_run=False)
         print("Migration v1.0 applied successfully.")
         return 0
     except Exception as err:
-        print(f"ERROR: Migration failed: {err}", file=sys.stderr)
+        print(f"ERROR: Migration failed: {redact_sensitive_text(str(err))}", file=sys.stderr)
         return 1
 
 

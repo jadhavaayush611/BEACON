@@ -26,8 +26,10 @@ class CandidateGenerator:
         cleaned = raw_type.strip().lower()
         return COMMON_EVENT_ALIASES.get(cleaned, cleaned)
 
-    def is_type_compatible(self, obs_type: str, event_type: str) -> bool:
+    def is_type_compatible(self, obs_type: Optional[str], event_type: Optional[str]) -> bool:
         """Check if event categories are compatible."""
+        if not obs_type or not event_type:
+            return False
         t1 = self.normalize_type(obs_type)
         t2 = self.normalize_type(event_type)
         return t1 == t2 or t1 in t2 or t2 in t1
@@ -88,6 +90,9 @@ class CandidateGenerator:
         existing_events: Iterable[UnifiedDisasterEvent],
     ) -> list[UnifiedDisasterEvent]:
         """Filter existing events down to plausible candidates for detailed scoring."""
+        if not getattr(observation, "is_event_eligible", True) or not observation.event_type:
+            return []
+
         candidates: list[UnifiedDisasterEvent] = []
 
         for event in existing_events:

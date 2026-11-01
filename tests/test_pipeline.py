@@ -165,7 +165,7 @@ class TestETLPipelineUnit:
 
     def test_pipeline_result_to_dict_serialization(self, sample_files: list[Path]) -> None:
         """Verify machine-readable serialization of pipeline run result."""
-        runner = ETLRunner(session_factory=None)
+        runner = ETLRunner(settings=Settings(database_url=None), session_factory=None)
         result = runner.run([sample_files[0]])
 
         data = result.to_dict()

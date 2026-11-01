@@ -104,6 +104,15 @@ class EventResolver:
         assigned_count = 0
 
         for obs in observations:
+            # Filter: only INCIDENT and IMAGE_INCIDENT observations are eligible for event resolution
+            if not getattr(obs, "is_incident", True):
+                logger.debug(
+                    "Skipping event resolution for non-incident observation '%s' (type: %s)",
+                    obs.observation_id,
+                    getattr(obs, "observation_type", "context"),
+                )
+                continue
+
             # Check if observation is already part of an existing event (idempotent re-observation)
             if obs.observation_id in obs_to_event_id:
                 target_event_id = obs_to_event_id[obs.observation_id]

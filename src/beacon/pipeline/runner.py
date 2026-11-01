@@ -9,6 +9,7 @@ triggered on-demand via the CLI or dashboard service with complete audit trail p
 from datetime import datetime, timezone
 import hashlib
 import logging
+import time
 from pathlib import Path
 from typing import Any, Optional, Sequence, Union
 
@@ -18,7 +19,7 @@ from beacon.config import Settings, get_settings
 from beacon.ingestion import IngestionResult, ingest_file
 from beacon.logging_config import redact_sensitive_text, setup_logging
 from beacon.models import DisasterObservation
-from beacon.pipeline.result import ETLPipelineResult, RunStatus
+from beacon.pipeline.result import ETLPipelineResult, PipelineRunRecord, RunStatus
 from beacon.pipeline.transform import ObservationTransformer
 from beacon.quality import DataQualityValidator, QualityReport
 from beacon.storage import StorageRepository, create_db_engine, get_session, get_session_factory
@@ -129,6 +130,7 @@ class ETLRunner:
         """
         paths = [Path(p) for p in file_paths]
         run_ts = datetime.now(timezone.utc)
+        monotonic_t0 = time.perf_counter()
         if retry_of_run_id:
             exec_id = f"retry_{retry_of_run_id[:16]}_{hashlib.sha256(run_ts.isoformat().encode('utf-8')).hexdigest()[:8]}"
             trigger_type = "retry"
@@ -142,113 +144,174 @@ class ETLRunner:
             len(paths),
         )
 
+        storage_enabled = self.session_factory is not None
+        # Record initial 'running' lifecycle status if database persistence is active
+        if storage_enabled and persist_run_record:
+            try:
+                assert self.session_factory is not None
+                initial_run = PipelineRunRecord(
+                    run_id=exec_id,
+                    status=RunStatus.RUNNING,
+                    started_at=run_ts,
+                    trigger_type=trigger_type,
+                    retry_of_run_id=retry_of_run_id,
+                    inputs_summary={
+                        "total_inputs": len(paths),
+                        "files": [{"source_file": str(p), "status": "pending"} for p in paths],
+                    },
+                    counts_summary={"storage_enabled": storage_enabled},
+                )
+                with get_session(self.session_factory) as session:
+                    self.repository.save_pipeline_run(initial_run, session)
+            except Exception as init_run_err:
+                logger.warning(
+                    "Could not persist initial 'running' record for run '%s': %s",
+                    exec_id,
+                    redact_sensitive_text(str(init_run_err)),
+                )
+
         errors: list[str] = []
         warnings: list[str] = []
-
-        # 1. Extract
-        ingestion_results = self.extract(paths)
-        files_succeeded = sum(1 for r in ingestion_results if r.is_success)
-        files_partially_successful = sum(1 for r in ingestion_results if r.is_partial)
-        files_failed = sum(1 for r in ingestion_results if r.is_failed)
-        files_skipped = sum(1 for r in ingestion_results if getattr(r, "is_skipped", False))
-
-        all_extracted_observations: list[DisasterObservation] = []
-        for r in ingestion_results:
-            all_extracted_observations.extend(r.observations)
-            if r.errors:
-                errors.extend([
-                    f"[{Path(r.source_record.source_file).name}]: {redact_sensitive_text(e)}"
-                    for e in r.errors
-                ])
-            if r.warnings:
-                warnings.extend([
-                    f"[{Path(r.source_record.source_file).name}]: {redact_sensitive_text(w)}"
-                    for w in r.warnings
-                ])
-
-        # 2. Transform
-        transformed_observations = self.transform(all_extracted_observations)
-
-        # 3. Validate
-        quality_report = self.validate(transformed_observations)
-
-        # 4. Load & Resolution
         records_persisted = 0
         events_synthesized = 0
         events_persisted = 0
         res_summary = None
-        storage_enabled = self.session_factory is not None
         persistence_failed = False
+        ingestion_results: list[IngestionResult] = []
+        all_extracted_observations: list[DisasterObservation] = []
+        transformed_observations: list[DisasterObservation] = []
+        quality_report = QualityReport()
 
-        if storage_enabled:
-            assert self.session_factory is not None
-            try:
-                # Execute all storage operations in a single atomic transaction boundary
-                with get_session(self.session_factory) as session:
-                    records_persisted = self.load(
-                        file_results=ingestion_results,
-                        quality_report=quality_report,
-                        session=session,
+        try:
+            # 1. Extract
+            ingestion_results = self.extract(paths)
+            files_succeeded = sum(1 for r in ingestion_results if r.is_success)
+            files_yielding_observations = sum(1 for r in ingestion_results if r.is_success and len(r.observations) > 0)
+            files_yielding_metadata = sum(1 for r in ingestion_results if r.is_success and len(r.observations) == 0)
+            files_partially_successful = sum(1 for r in ingestion_results if r.is_partial)
+            files_failed = sum(1 for r in ingestion_results if r.is_failed)
+            files_skipped = sum(1 for r in ingestion_results if getattr(r, "is_skipped", False))
+
+            for r in ingestion_results:
+                all_extracted_observations.extend(r.observations)
+                if r.errors:
+                    errors.extend([
+                        f"[{Path(r.source_record.source_file).name}]: {redact_sensitive_text(e)}"
+                        for e in r.errors
+                    ])
+                if r.warnings:
+                    warnings.extend([
+                        f"[{Path(r.source_record.source_file).name}]: {redact_sensitive_text(w)}"
+                        for w in r.warnings
+                    ])
+
+            # 2. Transform
+            transformed_observations = self.transform(all_extracted_observations)
+
+            # 3. Validate
+            quality_report = self.validate(transformed_observations)
+
+            # 4. Load & Resolution
+            if storage_enabled:
+                assert self.session_factory is not None
+                try:
+                    # Execute all storage operations in a single atomic transaction boundary
+                    with get_session(self.session_factory) as session:
+                        records_persisted = self.load(
+                            file_results=ingestion_results,
+                            quality_report=quality_report,
+                            session=session,
+                        )
+
+                        incident_accepted = [o for o in quality_report.accepted_records if getattr(o, "is_incident", True)]
+                        if enable_resolution and incident_accepted:
+                            logger.info(
+                                "Resolving %d accepted incident observations into unified events",
+                                len(incident_accepted),
+                            )
+                            existing_events, existing_event_obs = (
+                                self.repository.get_all_events_with_observations(session)
+                            )
+                            res_result = self.resolver.resolve_observations(
+                                incident_accepted,
+                                existing_events=existing_events,
+                                existing_event_observations=existing_event_obs,
+                            )
+                            events_synthesized = len(res_result.resolved_events)
+                            touched_events_count = len({
+                                o.assigned_event_id
+                                for o in res_result.outcomes
+                                if o.assigned_event_id
+                            })
+                            res_summary = {
+                                "total_observations": res_result.total_observations,
+                                "events_created": res_result.events_created,
+                                "events_updated": res_result.events_updated,
+                                "created_this_run": res_result.events_created,
+                                "updated_this_run": res_result.events_updated,
+                                "active_portfolio": len(res_result.resolved_events),
+                                "events_persisted_this_run": touched_events_count,
+                                "observations_assigned": res_result.observations_assigned,
+                                "ambiguous_count": res_result.ambiguous_count,
+                                "merge_candidates_count": len(res_result.merge_candidates),
+                                "resolved_events_count": len(res_result.resolved_events),
+                            }
+                            res_counts = self.repository.save_resolution_result(res_result, session)
+                            events_persisted = res_counts.get("events_persisted", 0)
+                except Exception as db_err:
+                    persistence_failed = True
+                    err_msg = f"Database persistence failed during ETL transaction: {redact_sensitive_text(str(db_err))}"
+                    logger.error(err_msg)
+                    errors.append(err_msg)
+                    records_persisted = 0
+                    events_persisted = 0
+            else:
+                logger.info("Database storage not configured; skipping persistence step")
+                incident_accepted = [o for o in quality_report.accepted_records if getattr(o, "is_incident", True)]
+                if enable_resolution and incident_accepted:
+                    logger.info(
+                        "Resolving %d accepted incident observations in-memory",
+                        len(incident_accepted),
                     )
-
-                    if enable_resolution and quality_report.accepted_records:
-                        logger.info(
-                            "Resolving %d accepted observations into unified events",
-                            len(quality_report.accepted_records),
-                        )
-                        existing_events, existing_event_obs = (
-                            self.repository.get_all_events_with_observations(session)
-                        )
-                        res_result = self.resolver.resolve_observations(
-                            quality_report.accepted_records,
-                            existing_events=existing_events,
-                            existing_event_observations=existing_event_obs,
-                        )
-                        events_synthesized = len(res_result.resolved_events)
-                        res_summary = {
-                            "total_observations": res_result.total_observations,
-                            "events_created": res_result.events_created,
-                            "events_updated": res_result.events_updated,
-                            "observations_assigned": res_result.observations_assigned,
-                            "ambiguous_count": res_result.ambiguous_count,
-                            "merge_candidates_count": len(res_result.merge_candidates),
-                            "resolved_events_count": len(res_result.resolved_events),
-                        }
-                        res_counts = self.repository.save_resolution_result(res_result, session)
-                        events_persisted = res_counts.get("events_persisted", 0)
-            except Exception as db_err:
-                persistence_failed = True
-                err_msg = f"Database persistence failed during ETL transaction: {redact_sensitive_text(str(db_err))}"
-                logger.error(err_msg)
-                errors.append(err_msg)
-                records_persisted = 0
-                events_persisted = 0
-        else:
-            logger.info("Database storage not configured; skipping persistence step")
-            if enable_resolution and quality_report.accepted_records:
-                logger.info(
-                    "Resolving %d accepted observations in-memory",
-                    len(quality_report.accepted_records),
-                )
-                res_result = self.resolver.resolve_observations(
-                    quality_report.accepted_records,
-                    existing_events=[],
-                    existing_event_observations={},
-                )
-                events_synthesized = len(res_result.resolved_events)
-                res_summary = {
-                    "total_observations": res_result.total_observations,
-                    "events_created": res_result.events_created,
-                    "events_updated": res_result.events_updated,
-                    "observations_assigned": res_result.observations_assigned,
-                    "ambiguous_count": res_result.ambiguous_count,
-                    "merge_candidates_count": len(res_result.merge_candidates),
-                    "resolved_events_count": len(res_result.resolved_events),
-                }
+                    res_result = self.resolver.resolve_observations(
+                        incident_accepted,
+                        existing_events=[],
+                        existing_event_observations={},
+                    )
+                    events_synthesized = len(res_result.resolved_events)
+                    touched_events_count = len({
+                        o.assigned_event_id
+                        for o in res_result.outcomes
+                        if o.assigned_event_id
+                    })
+                    res_summary = {
+                        "total_observations": res_result.total_observations,
+                        "events_created": res_result.events_created,
+                        "events_updated": res_result.events_updated,
+                        "created_this_run": res_result.events_created,
+                        "updated_this_run": res_result.events_updated,
+                        "active_portfolio": len(res_result.resolved_events),
+                        "events_persisted_this_run": 0,
+                        "observations_assigned": res_result.observations_assigned,
+                        "ambiguous_count": res_result.ambiguous_count,
+                        "merge_candidates_count": len(res_result.merge_candidates),
+                        "resolved_events_count": len(res_result.resolved_events),
+                    }
+        except Exception as unhandled_err:
+            persistence_failed = True
+            fatal_msg = f"Fatal pipeline error: {redact_sensitive_text(str(unhandled_err))}"
+            logger.error(fatal_msg)
+            errors.append(fatal_msg)
+            files_succeeded = sum(1 for r in ingestion_results if r.is_success)
+            files_yielding_observations = sum(1 for r in ingestion_results if r.is_success and len(r.observations) > 0)
+            files_yielding_metadata = sum(1 for r in ingestion_results if r.is_success and len(r.observations) == 0)
+            files_partially_successful = sum(1 for r in ingestion_results if r.is_partial)
+            files_failed = max(len(paths) - files_succeeded - files_partially_successful, 0)
+            files_skipped = 0
 
         # 5. Status & Timing
         completed_at = datetime.now(timezone.utc)
-        duration_seconds = max(0.0, (completed_at - run_ts).total_seconds())
+        duration_seconds = max(0.0, time.perf_counter() - monotonic_t0)
 
         if persistence_failed:
             final_status = RunStatus.FAILED
@@ -273,6 +336,8 @@ class ETLRunner:
             retry_of_run_id=retry_of_run_id,
             files_discovered=len(paths),
             files_succeeded=files_succeeded,
+            files_yielding_observations=files_yielding_observations,
+            files_yielding_metadata=files_yielding_metadata,
             files_partially_successful=files_partially_successful,
             files_failed=files_failed,
             files_skipped=files_skipped,
@@ -283,6 +348,10 @@ class ETLRunner:
             records_persisted=records_persisted,
             events_synthesized=events_synthesized,
             events_persisted=events_persisted,
+            events_created=res_summary.get("events_created", 0) if res_summary else 0,
+            events_updated=res_summary.get("events_updated", 0) if res_summary else 0,
+            active_portfolio=events_synthesized,
+            events_persisted_this_run=res_summary.get("events_persisted_this_run", events_persisted) if res_summary else 0,
             resolution_summary=res_summary,
             storage_enabled=storage_enabled,
             quality_report=quality_report,

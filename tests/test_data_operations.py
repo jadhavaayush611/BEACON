@@ -1,6 +1,7 @@
 """Comprehensive unit and integration tests for BEACON Phase 2F: Data Operations and Orchestration."""
 
 from datetime import timezone
+import json
 from pathlib import Path
 from unittest.mock import patch
 import pytest
@@ -404,3 +405,127 @@ class TestDashboardServiceOrchestration:
         assert len(runs) == 1
         assert runs[0].run_id == res.execution_id
         assert runs[0].status == RunStatus.COMPLETED
+
+# ==============================================================================
+# 5. Advanced Phase 2F Focused Verification Tests
+# ==============================================================================
+
+class TestPhase2FAdvancedOperations:
+    """Targeted tests for changed content under same filename, lifecycle transitions, and UI safety."""
+
+    def test_reprocessing_changed_content_under_same_filename(
+        self, tmp_path: Path, in_memory_db: sessionmaker
+    ) -> None:
+        """Reprocessing modified content under the exact same filename produces distinct hashes and source records."""
+        data_file = tmp_path / "stream_events.json"
+
+        # 1. Initial content: Flood observation
+        payload_1 = [
+            {
+                "record_id": "CLAIM-001",
+                "event_type": "flood",
+                "location": "Sector 4",
+                "event_time": "2026-10-29T10:00:00Z",
+                "latitude": 34.0522,
+                "longitude": -118.2437,
+                "severity": "severe",
+                "description": "Water main burst and street flooding.",
+                "confidence": 0.95,
+            }
+        ]
+        data_file.write_text(json.dumps(payload_1), encoding="utf-8")
+
+        runner = ETLRunner(session_factory=in_memory_db)
+        res1 = runner.run([data_file], enable_resolution=True)
+        assert res1.records_persisted == 1
+
+        with in_memory_db() as session:
+            sources_1 = session.execute(select(SourceModel)).scalars().all()
+            assert len(sources_1) == 1
+            src1_hash = sources_1[0].content_hash
+            src1_id = sources_1[0].source_id
+            obs_1 = session.execute(select(ObservationModel)).scalars().all()
+            assert len(obs_1) == 1
+            assert obs_1[0].source_id == src1_id
+
+        # 2. Modified content: Wildfire observation in same file path
+        payload_2 = [
+            {
+                "record_id": "CLAIM-002",
+                "event_type": "wildfire",
+                "location": "Sector 9",
+                "event_time": "2026-10-29T11:00:00Z",
+                "latitude": 34.1012,
+                "longitude": -118.3255,
+                "severity": "severe",
+                "description": "Brush fire ignited along perimeter.",
+                "confidence": 0.90,
+            }
+        ]
+        data_file.write_text(json.dumps(payload_2), encoding="utf-8")
+
+        res2 = runner.run([data_file], enable_resolution=True)
+        assert res2.records_persisted == 1
+
+        with in_memory_db() as session:
+            sources_2 = session.execute(select(SourceModel)).scalars().all()
+            # Must distinguish the modified version as a distinct source entry
+            assert len(sources_2) == 2
+            hashes = {s.content_hash for s in sources_2}
+            assert len(hashes) == 2
+            assert src1_hash in hashes
+
+            # Observations must both be preserved with their respective source linkages
+            obs_2 = session.execute(select(ObservationModel)).scalars().all()
+            assert len(obs_2) == 2
+            source_ids = {o.source_id for o in obs_2}
+            assert len(source_ids) == 2
+
+    def test_pipeline_run_lifecycle_fatal_error_does_not_stay_stuck_running(
+        self, tmp_path: Path, in_memory_db: sessionmaker
+    ) -> None:
+        """Fatal unhandled exception during ETL transitions lifecycle to failed and persists error."""
+        test_file = tmp_path / "valid.json"
+        test_file.write_text(json.dumps({"events": []}), encoding="utf-8")
+
+        runner = ETLRunner(session_factory=in_memory_db)
+
+        with patch.object(runner, "extract", side_effect=ValueError("Fatal extraction crash")):
+            result = runner.run([test_file], persist_run_record=True)
+
+        assert result.status == RunStatus.FAILED.value
+        assert any("Fatal extraction crash" in err for err in result.errors)
+
+        with in_memory_db() as session:
+            runs = session.execute(select(PipelineRunModel)).scalars().all()
+            assert len(runs) == 1
+            assert runs[0].status == "failed"
+            assert any("Fatal extraction crash" in f for f in runs[0].failure_details)
+
+    def test_dashboard_service_run_history_and_storage_mode_attribution(
+        self, sample_files: list[Path], in_memory_db: sessionmaker
+    ) -> None:
+        """DashboardService correctly stores and differentiates database vs in-memory runs."""
+        # In-memory service
+        mem_service = DashboardService(settings=Settings(database_url=None), session_factory=None)
+        res_mem = mem_service.run_pipeline_on_paths([sample_files[0]], persist_db=False)
+        assert res_mem.status == 'completed'
+        mem_runs = mem_service.list_pipeline_runs()
+        assert len(mem_runs) == 1
+        assert mem_runs[0].counts_summary.get("storage_enabled") is False
+
+        # Database-backed service
+        db_service = DashboardService(
+            settings=Settings(database_url="sqlite:///:memory:"), session_factory=in_memory_db
+        )
+        res_db = db_service.run_pipeline_on_paths([sample_files[0]], persist_db=True)
+        db_runs = db_service.list_pipeline_runs()
+        assert len(db_runs) == 1
+        assert db_runs[0].counts_summary.get("storage_enabled") is True
+
+        # Inspect run details
+        fetched_run = db_service.get_pipeline_run(res_db.execution_id)
+        assert fetched_run is not None
+        assert fetched_run.run_id == res_db.execution_id
+        assert len(fetched_run.input_files) >= 1
+        assert fetched_run.input_files[0].status == "success"

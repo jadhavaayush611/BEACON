@@ -68,12 +68,17 @@ class DashboardService:
         self.repository = repository or StorageRepository()
         self.analytics_service = analytics_service or AnalyticsService()
         self.session_factory = session_factory
+        self._explicit_session_factory = session_factory is not None
+        self._bound_database_url: Optional[str] = (
+            self._extract_engine_url(session_factory) if session_factory else self.settings.database_url
+        )
 
         # Initialize session factory lazily if database_url is configured
         if self.session_factory is None and self.settings.database_url:
             try:
                 engine = create_db_engine(settings=self.settings)
                 self.session_factory = get_session_factory(engine)
+                self._bound_database_url = self.settings.database_url
             except Exception as err:
                 logger.warning("Dashboard could not connect to configured database: %s", err)
 
@@ -84,13 +89,54 @@ class DashboardService:
         self._in_memory_pipeline_runs: list[PipelineRunRecord] = []
         self._last_pipeline_result: Optional[ETLPipelineResult] = None
 
+    def _extract_engine_url(self, factory: Optional[sessionmaker[Session]]) -> Optional[str]:
+        """Safely extract the bound engine URL string from a sessionmaker if available."""
+        if factory is None:
+            return None
+        bind = getattr(factory, "kw", {}).get("bind")
+        if bind is not None and hasattr(bind, "url"):
+            return str(bind.url)
+        return None
+
+    def _ensure_session_factory(self) -> Optional[sessionmaker[Session]]:
+        """Ensure session factory is initialized and synchronized with current settings."""
+        target_url = self.settings.database_url
+        if not target_url:
+            if not self._explicit_session_factory:
+                self.session_factory = None
+                self._bound_database_url = None
+            return self.session_factory
+
+        if self.session_factory is not None and not self._explicit_session_factory:
+            current_bound = self._bound_database_url or self._extract_engine_url(self.session_factory)
+            if current_bound != target_url:
+                logger.info("Database URL changed; refreshing session factory")
+                self.session_factory = None
+                self._bound_database_url = None
+
+        if self.session_factory is None:
+            try:
+                engine = create_db_engine(settings=self.settings)
+                self.session_factory = get_session_factory(engine)
+                self._bound_database_url = target_url
+            except Exception as err:
+                logger.debug(
+                    "Failed to initialize session factory for '%s': %s",
+                    redact_sensitive_text(target_url),
+                    err,
+                )
+                return None
+
+        return self.session_factory
+
     @property
     def is_database_reachable(self) -> bool:
         """Return True if a database session factory is available and responds to a ping query."""
-        if self.session_factory is None:
+        factory = self._ensure_session_factory()
+        if factory is None:
             return False
         try:
-            with get_session(self.session_factory) as session:
+            with get_session(factory) as session:
                 session.execute(text("SELECT 1"))
             return True
         except Exception:
@@ -99,12 +145,19 @@ class DashboardService:
     @property
     def is_schema_ready(self) -> bool:
         """Return True if database is reachable and all required BEACON schema tables exist."""
-        if self.session_factory is None:
+        factory = self._ensure_session_factory()
+        if factory is None:
             return False
         try:
-            with get_session(self.session_factory) as session:
-                inspector = inspect(session.get_bind())
-                existing = set(inspector.get_table_names())
+            with get_session(factory) as session:
+                bind = session.get_bind()
+                inspector = inspect(bind)
+                current_schema = (
+                    session.execute(text("SELECT current_schema()")).scalar()
+                    if bind.dialect.name == "postgresql"
+                    else None
+                )
+                existing = set(inspector.get_table_names(schema=current_schema))
                 return set(REQUIRED_TABLES).issubset(existing)
         except Exception as err:
             logger.debug("Schema readiness check failed: %s", err)
@@ -137,14 +190,29 @@ class DashboardService:
         masked_url = "[REDACTED]"
 
         try:
-            factory = self.session_factory
+            factory = self._ensure_session_factory()
             if factory is None:
-                engine = create_db_engine(settings=self.settings)
-                factory = get_session_factory(engine)
+                return {
+                    "connected": False,
+                    "schema_ready": False,
+                    "status": "error",
+                    "message": f"Connection initialization failed for {masked_url}",
+                    "engine_type": "PostgreSQL",
+                    "database_url_masked": masked_url,
+                    "tables": {},
+                    "total_tables": len(REQUIRED_TABLES),
+                    "ready_tables": 0,
+                }
             tables_count: dict[str, int] = {}
             with get_session(factory) as session:
-                inspector = inspect(session.get_bind())
-                existing_tables = set(inspector.get_table_names())
+                bind = session.get_bind()
+                inspector = inspect(bind)
+                current_schema = (
+                    session.execute(text("SELECT current_schema()")).scalar()
+                    if bind.dialect.name == "postgresql"
+                    else None
+                )
+                existing_tables = set(inspector.get_table_names(schema=current_schema))
                 for model, name in REQUIRED_TABLE_MODELS:
                     if name in existing_tables:
                         try:
@@ -159,13 +227,17 @@ class DashboardService:
             ready_count = sum(1 for c in tables_count.values() if c >= 0)
             missing = [name for name, count in tables_count.items() if count == -1]
             if missing:
+                if missing == ["pipeline_runs"]:
+                    migration_hint = "Run 'python scripts/init_db.py' to initialize the schema (or 'python scripts/migrate_v1_0.py' for additive v1.0 upgrade)."
+                else:
+                    migration_hint = "Run 'python scripts/init_db.py' to initialize the schema."
                 return {
                     "connected": True,
                     "schema_ready": False,
                     "status": "uninitialized",
                     "message": (
                         f"Connected to database, but {len(missing)} required table(s) are missing: "
-                        f"{', '.join(missing)}. Run 'python scripts/init_db.py' to initialize the schema."
+                        f"{', '.join(missing)}. {migration_hint}"
                     ),
                     "database_url_masked": masked_url,
                     "engine_type": "PostgreSQL",
@@ -222,6 +294,10 @@ class DashboardService:
                         "events_by_type": summary.events_by_type,
                         "events_by_severity": summary.events_by_severity,
                         "is_live_db": True,
+                        "storage_mode": "postgresql",
+                        "db_connected": True,
+                        "schema_ready": True,
+                        "uninitialized_db": False,
                     }
             except Exception as err:
                 logger.warning(
@@ -229,7 +305,7 @@ class DashboardService:
                     err,
                 )
 
-        # Fallback to in-memory state if DB is not connected
+        # Fallback to in-memory state if DB is not connected / schema uninitialized
         in_mem_ambig = sum(
             1 for out in self._in_memory_resolution_outcomes
             if getattr(out, "decision", None) and getattr(out.decision, "value", str(out.decision)) == "ambiguous_candidate"
@@ -240,6 +316,8 @@ class DashboardService:
             ambiguous_count=in_mem_ambig,
         )
         sources = {o.source_id for o in self._in_memory_observations}
+        db_reachable = self.is_database_reachable
+        schema_ready = self.is_schema_ready
         return {
             "sources_count": len(sources),
             "observations_count": summary.total_observations,
@@ -254,6 +332,10 @@ class DashboardService:
             "events_by_type": summary.events_by_type,
             "events_by_severity": summary.events_by_severity,
             "is_live_db": False,
+            "storage_mode": "in_memory",
+            "db_connected": db_reachable,
+            "schema_ready": schema_ready,
+            "uninitialized_db": db_reachable and not schema_ready,
         }
 
     def ingest_and_process_uploads(
@@ -307,7 +389,7 @@ class DashboardService:
                     "warnings": [],
                 }
 
-            # Stage 2: File Type & Integrity Validation
+            # Stage 2: Format Recognition & Preflight
             t0 = time.time()
             valid_files: list[tuple[str, bytes, Path]] = []
             invalid_files: list[tuple[str, str]] = []
@@ -335,10 +417,10 @@ class DashboardService:
 
             stages.append({
                 "stage_id": "validation_integrity",
-                "name": "2. File Type & Integrity Validation",
+                "name": "2. Format Recognition & Preflight",
                 "status": stage2_status,
-                "message": f"Validated {len(valid_files)}/{total_files} file(s) across recognized format signatures.",
-                "counts": {"files_valid": len(valid_files), "files_invalid": len(invalid_files)},
+                "message": f"Recognized {len(valid_files)}/{total_files} file format signature(s) eligible for extraction.",
+                "counts": {"files_valid": len(valid_files), "preflight_passed": len(valid_files), "files_invalid": len(invalid_files), "unsupported_or_empty": len(invalid_files)},
                 "details": [f"{fn}: {r}" for fn, r in invalid_files] if invalid_files else None,
                 "elapsed": round(time.time() - t0, 3),
             })
@@ -357,23 +439,52 @@ class DashboardService:
                     warnings.extend([f"[{safe_name}]: {w}" for w in res.warnings])
 
             files_succeeded = sum(1 for r in ingestion_results if r.is_success)
+            files_yielding_observations = sum(1 for r in ingestion_results if r.is_success and len(r.observations) > 0)
+            files_yielding_metadata = sum(1 for r in ingestion_results if r.is_success and len(r.observations) == 0)
+            files_partially_successful = sum(1 for r in ingestion_results if r.is_partial)
             files_failed = sum(1 for r in ingestion_results if r.is_failed) + len(invalid_files)
-            stage3_status = "completed"
-            if files_failed > 0 and files_succeeded > 0:
+            if files_failed > 0 and (files_succeeded > 0 or files_partially_successful > 0):
                 stage3_status = "warning"
-            elif files_failed > 0 and files_succeeded == 0:
+            elif files_failed > 0 and files_succeeded == 0 and files_partially_successful == 0:
                 stage3_status = "failed"
+            elif files_partially_successful > 0:
+                stage3_status = "warning"
+            else:
+                stage3_status = "completed"
+
+            if files_failed > 0:
+                stage3_msg = (
+                    f"Extracted {len(extracted_observations)} raw observation(s) from "
+                    f"{files_yielding_observations} file(s) ({files_yielding_metadata} file(s) yielded metadata/documentation); "
+                    f"{files_failed} file(s) failed extraction."
+                )
+            elif files_partially_successful > 0:
+                stage3_msg = (
+                    f"Extracted {len(extracted_observations)} raw observation(s) from {files_yielding_observations} file(s); "
+                    f"{files_partially_successful} file(s) partially extracted with warnings."
+                )
+            else:
+                stage3_msg = (
+                    f"Extracted {len(extracted_observations)} raw observation(s) across {files_yielding_observations} data file(s); "
+                    f"{files_yielding_metadata} supporting file(s) yielded verified metadata."
+                )
+
+            stage3_counts = {
+                "observations_extracted": len(extracted_observations),
+                "files_succeeded": files_succeeded,
+                "yielding_observations": files_yielding_observations,
+                "yielding_metadata": files_yielding_metadata,
+                "files_failed": files_failed,
+            }
+            if files_partially_successful > 0:
+                stage3_counts["files_partial"] = files_partially_successful
 
             stages.append({
                 "stage_id": "extraction",
                 "name": "3. Format-Specific Extraction",
                 "status": stage3_status,
-                "message": f"Extracted {len(extracted_observations)} raw observation(s) from {len(valid_files)} file(s).",
-                "counts": {
-                    "observations_extracted": len(extracted_observations),
-                    "files_succeeded": files_succeeded,
-                    "files_failed": files_failed,
-                },
+                "message": stage3_msg,
+                "counts": stage3_counts,
                 "elapsed": round(time.time() - t0, 3),
             })
 
@@ -416,12 +527,21 @@ class DashboardService:
             # Stage 6: Observation Creation
             t0 = time.time()
             accepted_observations = quality_report.accepted_records
+            incident_obs_count = sum(1 for o in accepted_observations if getattr(o, "is_incident", True))
+            context_obs_count = sum(1 for o in accepted_observations if not getattr(o, "is_incident", True))
             stages.append({
                 "stage_id": "observation_creation",
                 "name": "6. Observation Creation",
                 "status": "completed",
-                "message": f"Formed {len(accepted_observations)} canonical disaster observation(s) with deterministic IDs.",
-                "counts": {"observations_ready": len(accepted_observations)},
+                "message": (
+                    f"Formed {len(accepted_observations)} canonical observation(s) "
+                    f"({incident_obs_count} incident, {context_obs_count} context) with deterministic IDs."
+                ),
+                "counts": {
+                    "observations_ready": len(accepted_observations),
+                    "incident_observations": incident_obs_count,
+                    "context_observations": context_obs_count,
+                },
                 "elapsed": round(time.time() - t0, 3),
             })
 
@@ -445,24 +565,34 @@ class DashboardService:
                         for ev in self._in_memory_events
                     }
 
+                incident_accepted = [o for o in accepted_observations if getattr(o, "is_incident", True)]
                 resolution_result = resolver.resolve_observations(
-                    accepted_observations,
+                    incident_accepted,
                     existing_events=existing_events,
                     existing_event_observations=existing_event_obs,
                 )
                 resolved_events = resolution_result.resolved_events
                 resolution_outcomes = resolution_result.outcomes
 
+                events_created = resolution_result.events_created
+                events_updated = resolution_result.events_updated
+                active_portfolio = len(resolved_events)
+                ambiguous_count = resolution_result.ambiguous_count
+
                 stages.append({
                     "stage_id": "event_resolution",
                     "name": "7. Event Matching & Resolution",
                     "status": "completed",
-                    "message": f"Synthesized {len(resolved_events)} canonical disaster event(s) ({resolution_result.events_created} new, {resolution_result.events_updated} updated).",
+                    "message": (
+                        f"Resolution complete: {events_created} new event(s) created, "
+                        f"{events_updated} existing event(s) updated "
+                        f"({active_portfolio} total active event(s) in portfolio)."
+                    ),
                     "counts": {
-                        "events_synthesized": len(resolved_events),
-                        "events_created": resolution_result.events_created,
-                        "events_updated": resolution_result.events_updated,
-                        "ambiguous_count": resolution_result.ambiguous_count,
+                        "created_this_run": events_created,
+                        "updated_this_run": events_updated,
+                        "active_portfolio": active_portfolio,
+                        "ambiguous_count": ambiguous_count,
                     },
                     "elapsed": round(time.time() - t0, 3),
                 })
@@ -472,7 +602,11 @@ class DashboardService:
                     "name": "7. Event Matching & Resolution",
                     "status": "skipped",
                     "message": "Event resolution skipped per user configuration." if not enable_resolution else "No accepted observations to resolve.",
-                    "counts": {"events_synthesized": 0},
+                    "counts": {
+                        "created_this_run": 0,
+                        "updated_this_run": 0,
+                        "active_portfolio": len(self._in_memory_events),
+                    },
                     "elapsed": round(time.time() - t0, 3),
                 })
 
@@ -480,6 +614,7 @@ class DashboardService:
             t0 = time.time()
             records_persisted = 0
             events_persisted = 0
+            active_events_persisted = 0
             persistence_mode = "in_memory"
 
             can_persist_db = self.is_database_connected and persist_db
@@ -501,15 +636,26 @@ class DashboardService:
 
                         if resolution_result:
                             res_counts = self.repository.save_resolution_result(resolution_result, session)
-                            events_persisted = res_counts.get("events_persisted", 0)
+                            events_persisted = res_counts.get(
+                                "events_persisted_this_run",
+                                len({out.assigned_event_id for out in resolution_result.outcomes if out.assigned_event_id}),
+                            )
+                            active_events_persisted = res_counts.get("active_portfolio", res_counts.get("events_persisted", 0))
 
                     persistence_mode = "postgresql"
                     stages.append({
                         "stage_id": "persistence",
                         "name": "8. Persistence",
                         "status": "completed",
-                        "message": f"Persisted {records_persisted} observation(s) and {events_persisted} event(s) to PostgreSQL.",
-                        "counts": {"records_persisted": records_persisted, "events_persisted": events_persisted},
+                        "message": (
+                            f"Persisted {records_persisted} observation(s) and {events_persisted} event(s) this run "
+                            f"({active_events_persisted} total active event(s) in portfolio) to PostgreSQL."
+                        ),
+                        "counts": {
+                            "records_persisted": records_persisted,
+                            "events_persisted_this_run": events_persisted,
+                            "active_portfolio": active_events_persisted,
+                        },
                         "elapsed": round(time.time() - t0, 3),
                     })
                 except Exception as db_err:
@@ -521,7 +667,7 @@ class DashboardService:
                         "name": "8. Persistence",
                         "status": "failed",
                         "message": err_msg,
-                        "counts": {"records_persisted": 0, "events_persisted": 0},
+                        "counts": {"records_persisted": 0, "events_persisted_this_run": 0},
                         "elapsed": round(time.time() - t0, 3),
                     })
             else:
@@ -536,19 +682,28 @@ class DashboardService:
                     self._in_memory_resolution_outcomes = resolution_outcomes
 
                 diag = self.test_database_connection()
+                missing_tables = [k for k, v in diag.get("tables", {}).items() if v == -1]
                 if diag.get("connected") and not diag.get("schema_ready"):
-                    msg = "PostgreSQL connected but schema is incomplete: cached in-memory without persistent DB writes."
+                    msg = (
+                        f"PostgreSQL connected but schema is incomplete ({len(missing_tables)} missing table(s)): "
+                        f"cached {len(accepted_observations)} observation(s) in-memory without persistent DB writes."
+                    )
                 elif not self.settings.database_url:
-                    msg = "In-memory mode (stateless): cached in application session."
+                    msg = f"In-memory mode (stateless): cached {len(accepted_observations)} observation(s) in application session."
                 else:
-                    msg = "Persistence disabled by user: cached in-memory without persistent DB writes."
+                    msg = f"Persistence disabled by user: cached {len(accepted_observations)} observation(s) in-memory without persistent DB writes."
 
                 stages.append({
                     "stage_id": "persistence",
                     "name": "8. Persistence",
                     "status": "warning",
                     "message": msg,
-                    "counts": {"in_memory_cached": len(accepted_observations)},
+                    "counts": {
+                        "in_memory_cached": len(accepted_observations),
+                        "events_persisted_this_run": 0,
+                        "active_portfolio": len(resolved_events) if resolved_events else len(self._in_memory_events),
+                        "db_writes": 0,
+                    },
                     "elapsed": round(time.time() - t0, 3),
                 })
 
@@ -556,20 +711,72 @@ class DashboardService:
             total_elapsed = round(time.time() - start_ts, 3)
             final_status = "completed"
             if errors:
-                final_status = "failed" if files_succeeded == 0 else "warning"
-            elif warnings or stage2_status == "warning":
+                final_status = "failed" if (files_succeeded == 0 and files_partially_successful == 0) else "warning"
+            elif warnings or stage2_status == "warning" or stage3_status == "warning":
                 final_status = "warning"
+
+            summary_reasons = []
+            if files_failed > 0:
+                summary_reasons.append(f"{files_failed}/{total_files} file(s) failed extraction")
+            if files_partially_successful > 0:
+                summary_reasons.append(f"{files_partially_successful} file(s) partially extracted")
+            if quality_report.rejected_record_ids:
+                summary_reasons.append(f"{len(quality_report.rejected_record_ids)} observation(s) rejected by DQ audit")
+            if persistence_mode != "postgresql" and self.settings.database_url:
+                summary_reasons.append("PostgreSQL schema incomplete (cached in-memory)")
+
+            events_created_val = resolution_result.events_created if resolution_result else 0
+            events_updated_val = resolution_result.events_updated if resolution_result else 0
+            active_events_val = len(resolved_events) if resolved_events else len(self._in_memory_events)
+
+            if final_status == "completed":
+                inc_cnt = sum(1 for o in accepted_observations if getattr(o, "is_incident", True))
+                ctx_cnt = sum(1 for o in accepted_observations if not getattr(o, "is_incident", True))
+                summary_msg = (
+                    f"Batch completed successfully in {total_elapsed}s: All {total_files} file(s) successfully processed "
+                    f"({files_yielding_observations} yielding incident observations, {files_yielding_metadata} yielding context observations). "
+                    f"Formed {len(accepted_observations)} total observation(s) ({inc_cnt} incident, {ctx_cnt} context); "
+                    f"{events_created_val} event(s) created, {events_updated_val} event(s) updated; "
+                    f"{active_events_val} total active disaster event(s) in portfolio."
+                )
+            elif final_status == "failed":
+                summary_msg = (
+                    f"Batch failed in {total_elapsed}s: All {total_files} file(s) failed processing "
+                    f"({'; '.join(summary_reasons)})."
+                )
+            else:
+                reason_suffix = f" [{'; '.join(summary_reasons)}]" if summary_reasons else ""
+                if files_failed > 0:
+                    summary_msg = (
+                        f"Partial batch completed with warnings in {total_elapsed}s{reason_suffix}: "
+                        f"The batch was partial because {files_failed} of {total_files} file(s) failed extraction, "
+                        f"even though {len(accepted_observations)} valid observation(s) were accepted "
+                        f"({events_created_val} created this run, {events_updated_val} updated this run); "
+                        f"{active_events_val} total active event(s) in portfolio."
+                    )
+                else:
+                    summary_msg = (
+                        f"Batch completed with {len(warnings)} notice(s) in {total_elapsed}s{reason_suffix}: "
+                        f"All {total_files} file(s) successfully processed ({files_yielding_observations} yielding observations, "
+                        f"{files_yielding_metadata} yielding metadata/documentation); "
+                        f"{len(accepted_observations)} observation(s) accepted "
+                        f"({events_created_val} created this run, {events_updated_val} updated this run); "
+                        f"{active_events_val} total active event(s) in portfolio."
+                    )
 
             stages.append({
                 "stage_id": "final_summary",
                 "name": "9. Final Summary",
                 "status": final_status,
-                "message": f"Processed {total_files} file(s) in {total_elapsed}s. {len(accepted_observations)} observation(s) accepted, {len(resolved_events)} event(s) active.",
+                "message": summary_msg,
                 "counts": {
                     "total_files": total_files,
                     "files_succeeded": files_succeeded,
+                    "files_failed": files_failed,
                     "observations_accepted": len(accepted_observations),
-                    "events_active": len(resolved_events),
+                    "created_this_run": events_created_val,
+                    "updated_this_run": events_updated_val,
+                    "active_portfolio": active_events_val,
                 },
                 "elapsed": total_elapsed,
             })

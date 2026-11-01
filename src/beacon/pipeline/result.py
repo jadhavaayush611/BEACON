@@ -28,7 +28,10 @@ class InputFileExecutionRecord(BaseModel):
     source_file: str = Field(description="Normalized or relative path to the input file")
     source_type: str = Field(description="Source data format identifier")
     status: str = Field(description="Per-input execution status: success, partial, failed, skipped")
+    outcome: str = Field(default="observations_extracted", description="Extraction outcome classification")
     extracted_count: int = Field(default=0, description="Total observations extracted")
+    explanation: Optional[str] = Field(default=None, description="Detailed analysis explanation")
+    document_metadata: dict[str, Any] = Field(default_factory=dict, description="Extracted document-level metadata")
     errors: list[str] = Field(default_factory=list, description="Sanitized per-input error messages")
     warnings: list[str] = Field(default_factory=list, description="Sanitized per-input warnings")
 
@@ -96,11 +99,13 @@ class PipelineRunRecord(BaseModel):
         if self.input_files:
             return [f.source_file for f in self.input_files]
         if "files" in self.inputs_summary:
-            return [
-                f["source_file"]
-                for f in self.inputs_summary["files"]
-                if isinstance(f, dict) and f.get("source_file")
-            ]
+            results = []
+            for f in self.inputs_summary["files"]:
+                if isinstance(f, dict) and f.get("source_file"):
+                    results.append(f["source_file"])
+                elif isinstance(f, str):
+                    results.append(f)
+            return results
         return []
 
 
@@ -136,6 +141,14 @@ class ETLPipelineResult(BaseModel):
     )
     files_discovered: int = Field(default=0, description="Total input files identified for processing")
     files_succeeded: int = Field(default=0, description="Number of files successfully ingested")
+    files_yielding_observations: int = Field(
+        default=0,
+        description="Number of files yielding canonical disaster observations",
+    )
+    files_yielding_metadata: int = Field(
+        default=0,
+        description="Number of files yielding document or container metadata only",
+    )
     files_partially_successful: int = Field(
         default=0,
         description="Number of files partially ingested with some records accepted and some rejected",
@@ -148,8 +161,12 @@ class ETLPipelineResult(BaseModel):
     observations_accepted: int = Field(default=0, description="Total observations passing data quality")
     observations_rejected: int = Field(default=0, description="Total observations failing data quality")
     records_persisted: int = Field(default=0, description="Total observation records committed to storage")
-    events_synthesized: int = Field(default=0, description="Total unified events created or updated through resolution")
+    events_synthesized: int = Field(default=0, description="Total unified events in portfolio after resolution")
+    events_created: int = Field(default=0, description="New unified events created during the current run")
+    events_updated: int = Field(default=0, description="Existing unified events updated during the current run")
+    active_portfolio: int = Field(default=0, description="Total active unified events in the database portfolio")
     events_persisted: int = Field(default=0, description="Total unified event records committed to storage")
+    events_persisted_this_run: int = Field(default=0, description="Events created or modified and persisted during this run")
     resolution_summary: Optional[dict] = Field(default=None, description="Summary details of event resolution")
 
     storage_enabled: bool = Field(default=False, description="Whether database storage was enabled/configured")
@@ -180,12 +197,16 @@ class ETLPipelineResult(BaseModel):
         input_file_records = []
         for fr in self.file_results:
             src = fr.source_record
+            outcome_val = fr.outcome.value if hasattr(fr, "outcome") and fr.outcome else "observations_extracted"
             input_file_records.append(
                 InputFileExecutionRecord(
                     source_file=src.source_file,
                     source_type=src.source_type.value,
                     status=fr.status.value,
+                    outcome=outcome_val,
                     extracted_count=len(fr.observations),
+                    explanation=getattr(fr, "explanation", None),
+                    document_metadata=getattr(fr, "document_metadata", {}) or {},
                     errors=[redact_sensitive_text(e) for e in fr.errors],
                     warnings=[redact_sensitive_text(w) for w in fr.warnings],
                 )
@@ -200,6 +221,8 @@ class ETLPipelineResult(BaseModel):
             "partially_successful": self.files_partially_successful,
             "failed": self.files_failed,
             "skipped": self.files_skipped,
+            "yielding_observations": self.files_yielding_observations,
+            "yielding_metadata": self.files_yielding_metadata,
             "failed_inputs": failed_inputs,
             "succeeded_inputs": succeeded_inputs,
             "files": [r.model_dump() for r in input_file_records],
@@ -213,6 +236,10 @@ class ETLPipelineResult(BaseModel):
             "records_persisted": self.records_persisted,
             "events_synthesized": self.events_synthesized,
             "events_persisted": self.events_persisted,
+            "events_created": self.events_created,
+            "events_updated": self.events_updated,
+            "active_portfolio": self.active_portfolio,
+            "events_persisted_this_run": self.events_persisted_this_run,
             "storage_enabled": self.storage_enabled,
         }
         if self.resolution_summary:
@@ -253,7 +280,7 @@ class ETLPipelineResult(BaseModel):
             f"{self.files_partially_successful} partial, {self.files_failed} failed, {self.files_skipped} skipped",
             f"Observations: {self.observations_extracted} extracted, {self.observations_transformed} transformed",
             f"Data Quality: {self.observations_accepted} accepted, {self.observations_rejected} rejected",
-            f"Persistence: {'Enabled' if self.storage_enabled else 'Disabled'} ({self.records_persisted} observations stored)",
+            f"Persistence: {'Enabled' if self.storage_enabled else 'Disabled'} ({self.records_persisted} observations stored, {self.events_persisted_this_run or self.events_persisted} events persisted this run; {self.active_portfolio or self.events_synthesized} active events in portfolio)",
         ]
         if self.duration_seconds is not None:
             lines.append(f"Duration: {self.duration_seconds:.2f}s")

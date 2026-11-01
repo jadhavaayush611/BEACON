@@ -12,6 +12,7 @@ from beacon.models import (
     DisasterObservation,
     ExtractionMethod,
     ExtractionStatus,
+    ObservationType,
     SourceRecord,
     SourceType,
     UnifiedDisasterEvent,
@@ -100,8 +101,14 @@ class StorageRepository:
                 select(ObservationModel).where(ObservationModel.observation_id == obs.observation_id)
             ).scalar_one_or_none()
 
+            obs_type_val = obs.observation_type.value if hasattr(obs.observation_type, "value") else str(obs.observation_type)
+            is_eligible_val = obs.is_event_eligible
+            payload_val = dict(obs.context_payload or {})
+
             if existing:
                 logger.debug("Observation '%s' exists; updating record", obs.observation_id)
+                existing.observation_type = obs_type_val
+                existing.is_event_eligible = is_eligible_val
                 existing.event_type = obs.event_type
                 existing.location = obs.location
                 existing.event_time = obs.event_time
@@ -113,12 +120,15 @@ class StorageRepository:
                 existing.page_number = obs.page_number
                 existing.source_reference = obs.source_reference
                 existing.raw_claim = obs.raw_claim
+                existing.context_payload = payload_val
                 existing.validation_warnings = list(obs.validation_warnings)
                 existing.updated_at = datetime.now(timezone.utc)
             else:
                 model = ObservationModel(
                     observation_id=obs.observation_id,
                     source_id=obs.source_id,
+                    observation_type=obs_type_val,
+                    is_event_eligible=is_eligible_val,
                     event_type=obs.event_type,
                     location=obs.location,
                     event_time=obs.event_time,
@@ -130,6 +140,7 @@ class StorageRepository:
                     page_number=obs.page_number,
                     source_reference=obs.source_reference,
                     raw_claim=obs.raw_claim,
+                    context_payload=payload_val,
                     validation_warnings=list(obs.validation_warnings),
                 )
                 session.add(model)
@@ -211,6 +222,7 @@ class StorageRepository:
             DisasterObservation(
                 observation_id=m.observation_id,
                 source_id=m.source_id,
+                observation_type=ObservationType(getattr(m, "observation_type", "incident") or "incident"),
                 event_type=m.event_type,
                 location=m.location,
                 event_time=_ensure_utc(m.event_time),
@@ -222,6 +234,7 @@ class StorageRepository:
                 page_number=m.page_number,
                 source_reference=m.source_reference,
                 raw_claim=m.raw_claim,
+                context_payload=dict(getattr(m, "context_payload", {}) or {}),
                 validation_warnings=list(m.validation_warnings or []),
             )
             for m in models
@@ -419,8 +432,16 @@ class StorageRepository:
         merges_saved = self.save_merge_candidates(result.merge_candidates, session)
         session.flush()
 
+        touched_event_ids = {
+            outcome.assigned_event_id
+            for outcome in result.outcomes
+            if outcome.assigned_event_id
+        }
+
         return {
             "events_persisted": events_saved,
+            "events_persisted_this_run": len(touched_event_ids),
+            "active_portfolio": events_saved,
             "links_persisted": links_saved,
             "decisions_persisted": decisions_saved,
             "merge_candidates_persisted": merges_saved,
@@ -548,6 +569,7 @@ class StorageRepository:
             DisasterObservation(
                 observation_id=m.observation_id,
                 source_id=m.source_id,
+                observation_type=ObservationType(getattr(m, "observation_type", "incident") or "incident"),
                 event_type=m.event_type,
                 location=m.location,
                 event_time=_ensure_utc(m.event_time),
@@ -559,6 +581,7 @@ class StorageRepository:
                 page_number=m.page_number,
                 source_reference=m.source_reference,
                 raw_claim=m.raw_claim,
+                context_payload=dict(getattr(m, "context_payload", {}) or {}),
                 validation_warnings=list(m.validation_warnings or []),
             )
             for m in models
@@ -595,7 +618,10 @@ class StorageRepository:
         linked_subquery = select(EventObservationModel.observation_id)
         stmt = (
             select(ObservationModel)
-            .where(ObservationModel.observation_id.not_in(linked_subquery))
+            .where(
+                ObservationModel.observation_id.not_in(linked_subquery),
+                ObservationModel.is_event_eligible.is_(True),
+            )
             .order_by(ObservationModel.created_at.desc())
         )
         models = session.execute(stmt).scalars().all()
@@ -603,6 +629,7 @@ class StorageRepository:
             DisasterObservation(
                 observation_id=m.observation_id,
                 source_id=m.source_id,
+                observation_type=ObservationType(getattr(m, "observation_type", "incident") or "incident"),
                 event_type=m.event_type,
                 location=m.location,
                 event_time=_ensure_utc(m.event_time),
@@ -614,6 +641,7 @@ class StorageRepository:
                 page_number=m.page_number,
                 source_reference=m.source_reference,
                 raw_claim=m.raw_claim,
+                context_payload=dict(getattr(m, "context_payload", {}) or {}),
                 validation_warnings=list(m.validation_warnings or []),
             )
             for m in models
@@ -627,7 +655,10 @@ class StorageRepository:
         linked_subquery = select(EventObservationModel.observation_id)
         stmt = (
             select(ObservationModel)
-            .where(ObservationModel.observation_id.not_in(linked_subquery))
+            .where(
+                ObservationModel.observation_id.not_in(linked_subquery),
+                ObservationModel.is_event_eligible.is_(True),
+            )
             .order_by(ObservationModel.created_at.desc())
         )
         models = session.execute(stmt).scalars().all()
@@ -637,6 +668,7 @@ class StorageRepository:
             obs = DisasterObservation(
                 observation_id=m.observation_id,
                 source_id=m.source_id,
+                observation_type=ObservationType(getattr(m, "observation_type", "incident") or "incident"),
                 event_type=m.event_type,
                 location=m.location,
                 event_time=_ensure_utc(m.event_time),
@@ -648,6 +680,7 @@ class StorageRepository:
                 page_number=m.page_number,
                 source_reference=m.source_reference,
                 raw_claim=m.raw_claim,
+                context_payload=dict(getattr(m, "context_payload", {}) or {}),
                 validation_warnings=list(m.validation_warnings or []),
             )
             dec_stmt = (
@@ -671,6 +704,42 @@ class StorageRepository:
             })
 
         return results
+
+    def get_all_observations(
+        self,
+        session: Session,
+        observation_type: Optional[str] = None,
+        event_eligible_only: bool = False,
+    ) -> list[DisasterObservation]:
+        """Fetch all stored observations with optional type filtering."""
+        stmt = select(ObservationModel).order_by(ObservationModel.created_at.desc())
+        if observation_type:
+            stmt = stmt.where(ObservationModel.observation_type == observation_type.lower())
+        if event_eligible_only:
+            stmt = stmt.where(ObservationModel.is_event_eligible.is_(True))
+
+        models = session.execute(stmt).scalars().all()
+        return [
+            DisasterObservation(
+                observation_id=m.observation_id,
+                source_id=m.source_id,
+                observation_type=ObservationType(getattr(m, "observation_type", "incident") or "incident"),
+                event_type=m.event_type,
+                location=m.location,
+                event_time=_ensure_utc(m.event_time),
+                description=m.description,
+                severity=m.severity,
+                latitude=m.latitude,
+                longitude=m.longitude,
+                extraction_confidence=m.extraction_confidence,
+                page_number=m.page_number,
+                source_reference=m.source_reference,
+                raw_claim=m.raw_claim,
+                context_payload=dict(getattr(m, "context_payload", {}) or {}),
+                validation_warnings=list(m.validation_warnings or []),
+            )
+            for m in models
+        ]
 
     def save_pipeline_run(
         self,

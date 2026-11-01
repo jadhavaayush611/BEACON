@@ -44,19 +44,20 @@ def check_required_fields(obs: DisasterObservation) -> list[ValidationOutcome]:
             )
         )
 
-    # 3. event_type
-    if not obs.event_type or not obs.event_type.strip():
-        outcomes.append(
-            ValidationOutcome(
-                record_id=obs.observation_id,
-                source_id=obs.source_id,
-                rule_name="REQUIRED_EVENT_TYPE",
-                field_name="event_type",
-                severity=RuleSeverity.ERROR,
-                message="event_type is mandatory and cannot be empty",
-                passed=False,
+    # 3. event_type (mandatory for incident observations)
+    if getattr(obs, "is_incident", True):
+        if not obs.event_type or not obs.event_type.strip():
+            outcomes.append(
+                ValidationOutcome(
+                    record_id=obs.observation_id,
+                    source_id=obs.source_id,
+                    rule_name="REQUIRED_EVENT_TYPE",
+                    field_name="event_type",
+                    severity=RuleSeverity.ERROR,
+                    message="event_type is mandatory and cannot be empty for incident observations",
+                    passed=False,
+                )
             )
-        )
 
     return outcomes
 
@@ -225,9 +226,9 @@ def check_vocabulary_standards(obs: DisasterObservation) -> list[ValidationOutco
     """Check whether disaster category and severity adhere to standard vocabularies."""
     outcomes: list[ValidationOutcome] = []
 
-    # Category standard
-    cat = obs.event_type.strip().lower()
-    if cat not in STANDARD_EVENT_TYPES:
+    # Category standard (for incident observations or observations declaring event_type)
+    cat = obs.event_type.strip().lower() if obs.event_type else None
+    if getattr(obs, "is_incident", True) and cat and cat not in STANDARD_EVENT_TYPES:
         outcomes.append(
             ValidationOutcome(
                 record_id=obs.observation_id,
@@ -289,10 +290,11 @@ def check_batch_duplicates(
             seen_ids[obs.observation_id] = obs
 
         # 2. Duplicate claim signature within same source
-        # (same source_id, event_type, location, event_time)
+        # (same source_id, event_type or obs_type, location, event_time)
+        ev_or_obs_type = (obs.event_type.strip().lower() if obs.event_type else obs.observation_type.value)
         sig = (
             obs.source_id,
-            obs.event_type.strip().lower(),
+            ev_or_obs_type,
             (obs.location or "").strip().lower(),
             obs.event_time.isoformat() if obs.event_time else None,
         )

@@ -169,6 +169,34 @@ with tab_overview:
     total_src = overview["sources_count"]
     comp_ratio = overview.get("compression_ratio")
 
+    if overview.get("is_live_db"):
+        st.markdown(
+            '<div style="margin-bottom: 0.5rem;">'
+            '<span class="beacon-status-pill status-live">🟢 STORAGE: PERSISTED (POSTGRESQL)</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+    elif overview.get("uninitialized_db"):
+        st.markdown(
+            '<div style="margin-bottom: 0.5rem;">'
+            '<span class="beacon-status-pill status-memory">🟡 STORAGE: IN-MEMORY (POSTGRESQL UNINITIALIZED)</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+        st.info(
+            "ℹ️ **PostgreSQL Connected but Incomplete:** Database is reachable, but 1 required table "
+            "(`pipeline_runs`) is missing. Overview metrics reflect the isolated in-memory session (0 records) "
+            "to prevent querying an unmigrated schema. Persisted database records remain safely isolated until "
+            "the additive migration (`python scripts/migrate_v1_0.py`) is applied."
+        )
+    else:
+        st.markdown(
+            '<div style="margin-bottom: 0.5rem;">'
+            '<span class="beacon-status-pill status-memory">🟡 STORAGE: IN-MEMORY (STATELESS)</span>'
+            '</div>',
+            unsafe_allow_html=True,
+        )
+
     # Four Command Center KPI Cards
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -217,12 +245,24 @@ with tab_overview:
     geo_df = extract_geographic_dataframe(events_for_overview)
 
     if total_ev == 0:
-        render_empty_state(
-            title="Command Center Idle",
-            message="No disaster events are currently loaded in system memory or database storage.",
-            icon="🚨",
-            guidance="Navigate to the 'Pipeline Execution' tab to run the automated ETL and resolution pipeline.",
-        )
+        if overview.get("uninitialized_db"):
+            render_empty_state(
+                title="Command Center Idle — In-Memory Fallback Active",
+                message=(
+                    "No disaster events are currently loaded in the active in-memory session. "
+                    "Note: PostgreSQL is connected, but schema is uninitialized (missing: pipeline_runs). "
+                    "Existing database records remain isolated until migration is applied."
+                ),
+                icon="🚨",
+                guidance="Execute additive migration ('python scripts/migrate_v1_0.py') to activate database persistence, or run a pipeline execution in-memory.",
+            )
+        else:
+            render_empty_state(
+                title="Command Center Idle",
+                message="No disaster events are currently loaded in system memory or database storage.",
+                icon="🚨",
+                guidance="Navigate to the 'Pipeline Execution' tab to run the automated ETL and resolution pipeline.",
+            )
     else:
         g_col1, g_col2 = st.columns([1, 1])
         with g_col1:
@@ -356,13 +396,19 @@ with tab_ingest:
         if results:
             rows = []
             for r in results:
+                meta_summary = ""
+                if getattr(r, "document_metadata", None):
+                    meta_summary = f"{len(r.document_metadata)} fields ({r.document_metadata.get('document_type', 'metadata')})"
+                outcome_val = getattr(r, "outcome", None)
+                outcome_str = outcome_val.value.upper() if hasattr(outcome_val, "value") else str(outcome_val or "OBSERVATIONS_EXTRACTED").upper()
                 rows.append({
                     "Filename": Path(r.source_record.source_file).name,
-                    "Type": r.source_record.source_type.value.upper(),
+                    "Format": r.source_record.source_type.value.upper(),
                     "Status": r.status.value.upper(),
-                    "Observations Extracted": len(r.observations),
-                    "Errors": len(r.errors),
-                    "Warnings": len(r.warnings),
+                    "Extraction Outcome": outcome_str,
+                    "Observations": len(r.observations),
+                    "Metadata": meta_summary or "—",
+                    "Explanation": getattr(r, "explanation", "") or "—",
                 })
             st.subheader("Ingestion Results per File")
             st.dataframe(rows, width="stretch")
@@ -370,22 +416,49 @@ with tab_ingest:
         # 3. Batch Analytics KPI Metrics
         obs = ingest_data.get("observations", [])
         evts = ingest_data.get("events", [])
-        k1, k2, k3, k4 = st.columns(4)
-        with k1:
-            st.metric("Files Processed", len(results))
-        with k2:
-            st.metric("Observations Extracted", len(obs))
-        with k3:
-            qr = ingest_data.get("quality_report")
-            pass_rate = f"{(qr.passed_count / max(1, qr.passed_count + qr.failed_count)) * 100:.0f}%" if qr else "100%"
-            st.metric("Quality Audit Pass Rate", pass_rate)
-        with k4:
-            st.metric("Canonical Events Active", len(evts))
+        incident_obs = [o for o in obs if getattr(o, "is_incident", True)]
+        context_obs = [o for o in obs if not getattr(o, "is_incident", True)]
 
-        # 4. Unified Presentation of Newly Ingested Observations & Canonical Event Profiles
+        k1, k2, k3, k4, k5 = st.columns(5)
+        with k1:
+            st.metric("Files Analysed", len(results))
+        with k2:
+            st.metric("Total Observations", len(obs))
+        with k3:
+            st.metric("Incident Claims", len(incident_obs))
+        with k4:
+            st.metric("Context Records", len(context_obs))
+        with k5:
+            st.metric("Active Disaster Events", len(evts))
+
+        # 4. Unified Observation Explorer with Type Filtering
         st.markdown("---")
-        st.subheader("📋 Extracted Disaster Observations & Canonical Profiles")
-        st.caption("Individual incident claims synthesized across reporting channels with complete audit lineage.")
+        st.subheader("📋 Universal Observation Explorer")
+        st.caption("Inspect extracted atomic incident claims and supporting contextual records with complete provenance.")
+
+        # Filter by observation type
+        obs_filter_col1, obs_filter_col2 = st.columns([1, 2])
+        with obs_filter_col1:
+            obs_type_filter = st.selectbox(
+                "Filter Observation Category:",
+                options=["All Observations", "Incident Observations Only", "Context Observations Only"],
+                key="obs_explorer_type_filter",
+            )
+        with obs_filter_col2:
+            st.markdown(
+                f"<div style='margin-top: 1.8rem; font-size: 0.85rem; color: #64748b;'>"
+                f"Showing <b>{len(obs)}</b> total observation(s): <b>{len(incident_obs)}</b> incident (event-eligible), "
+                f"<b>{len(context_obs)}</b> supporting context (non-event)."
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
+        if obs_type_filter == "Incident Observations Only":
+            display_obs = incident_obs
+        elif obs_type_filter == "Context Observations Only":
+            display_obs = context_obs
+        else:
+            display_obs = obs
 
         # Build event and decision maps for rich observation cards
         ev_map = {}
@@ -401,7 +474,7 @@ with tab_ingest:
                 "rationale": out.rationale,
             }
 
-        render_observation_cards(obs, event_map=ev_map, resolution_decisions=dec_map)
+        render_observation_cards(display_obs, event_map=ev_map, resolution_decisions=dec_map)
 
     st.markdown("---")
 
@@ -562,7 +635,7 @@ with tab_pipeline:
         m2.metric("Raw Extracted", last_result.observations_extracted)
         m3.metric("Quality Accepted", last_result.observations_accepted)
         m4.metric("Quality Rejected", last_result.observations_rejected)
-        m5.metric("Events Synthesized", last_result.events_synthesized)
+        m5.metric("Active Portfolio", getattr(last_result, "active_portfolio", last_result.events_synthesized))
 
         if last_result.errors:
             st.error(f"Encountered {len(last_result.errors)} pipeline error(s):")
@@ -586,7 +659,25 @@ with tab_pipeline:
 
     # Section: Run History & Safe Retries
     st.markdown("---")
-    st.subheader("📜 Pipeline Run History & Audit Trail")
+    col_hist_title, col_hist_mode = st.columns([2, 1])
+    with col_hist_title:
+        st.subheader("📜 Pipeline Run History & Audit Trail")
+    with col_hist_mode:
+        if service.is_database_connected:
+            st.markdown(
+                '<div style="text-align: right; margin-top: 0.5rem;">'
+                '<span class="beacon-status-pill status-live">🗄️ PERSISTED (DATABASE)</span>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                '<div style="text-align: right; margin-top: 0.5rem;">'
+                '<span class="beacon-status-pill status-memory">🧠 IN-MEMORY (EPHEMERAL)</span>'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+
     recent_runs = service.list_pipeline_runs(limit=10)
 
     if not recent_runs:
@@ -603,9 +694,11 @@ with tab_pipeline:
             if inputs_meta.get("failed", 0) > 0:
                 files_str += f" ({inputs_meta.get('failed')} failed)"
             dur_str = f"{r.duration_seconds:.2f}s" if r.duration_seconds is not None else "—"
+            storage_label = "PostgreSQL" if counts_meta.get("storage_enabled", False) else "In-Memory"
             run_rows.append({
                 "Run ID": r.run_id,
                 "Status": r.status.value.upper(),
+                "Storage": storage_label,
                 "Trigger": r.trigger_type.upper(),
                 "Retry Of": r.retry_of_run_id or "—",
                 "Started (UTC)": format_timestamp(r.started_at),
@@ -618,16 +711,71 @@ with tab_pipeline:
             })
         st.dataframe(run_rows, width="stretch")
 
+        # Granular Run Inspector
+        st.markdown("##### 🔍 Run Inspector & Granular File Attribution")
+        inspect_options = [r.run_id for r in recent_runs]
+        selected_inspect_id = st.selectbox(
+            "Select execution run to inspect:",
+            options=inspect_options,
+            key="select_inspect_run_id",
+            help="Inspect per-file outcomes, quality audit counts, and error attribution for a specific run.",
+        )
+        selected_run = next((r for r in recent_runs if r.run_id == selected_inspect_id), None)
+        if selected_run:
+            in_meta = selected_run.inputs_summary or {}
+            cnt_meta = selected_run.counts_summary or {}
+
+            # Metric chips for the inspected run
+            k1, k2, k3, k4, k5 = st.columns(5)
+            k1.metric("Status", selected_run.status.value.upper())
+            k2.metric("Duration", f"{selected_run.duration_seconds:.2f}s" if selected_run.duration_seconds is not None else "—")
+            k3.metric("Trigger / Mode", selected_run.trigger_type.upper())
+            k4.metric("Inputs Succeeded", f"{in_meta.get('succeeded', 0)}/{in_meta.get('total_inputs', 0)}")
+            k5.metric("Events Active", cnt_meta.get("events_synthesized", 0))
+
+            # Per-file outcomes table
+            files_meta = in_meta.get("files", [])
+            if files_meta:
+                st.markdown("###### 📁 File-Level Batch Processing Outcomes")
+                file_rows = []
+                for f in files_meta:
+                    f_path = f.get("source_file", "") if isinstance(f, dict) else str(f)
+                    f_name = Path(f_path).name if f_path else "Unknown"
+                    f_status = f.get("status", "unknown").upper() if isinstance(f, dict) else "PROCESSED"
+                    f_type = f.get("source_type", "DATA").upper() if isinstance(f, dict) else "DATA"
+                    f_outcome = f.get("outcome", "OBSERVATIONS_EXTRACTED").upper() if isinstance(f, dict) else "OBSERVATIONS_EXTRACTED"
+                    f_ext = f.get("extracted_count", 0) if isinstance(f, dict) else 0
+                    f_expl = f.get("explanation", "") if isinstance(f, dict) else ""
+                    f_errs = len(f.get("errors", [])) if isinstance(f, dict) else 0
+                    f_warns = len(f.get("warnings", [])) if isinstance(f, dict) else 0
+                    file_rows.append({
+                        "Filename": f_name,
+                        "Format": f_type,
+                        "Status": f_status,
+                        "Outcome": f_outcome,
+                        "Observations": f_ext,
+                        "Explanation": f_expl or "—",
+                        "Errors": f_errs,
+                        "Warnings": f_warns,
+                    })
+                st.dataframe(file_rows, width="stretch")
+
+            # Error & failure details if any
+            if selected_run.failure_details:
+                st.markdown("###### ⚠️ Failure Traces & Errors (Sanitized)")
+                for f_err in selected_run.failure_details:
+                    st.error(redact_sensitive_text(f_err))
+
         # Retry controls for failed or partial runs
         failed_or_partial_runs = [
             r for r in recent_runs if r.status.value in ("failed", "partial")
         ]
+        st.markdown("##### 🔄 Safe Execution Retries")
         if failed_or_partial_runs:
-            st.markdown("##### 🔄 Safe Execution Retries")
             col_r1, col_r2, col_r3 = st.columns([2, 1, 1])
             with col_r1:
                 selected_retry_id = st.selectbox(
-                    "Select execution run to retry:",
+                    "Select failed or partial run to retry:",
                     options=[r.run_id for r in failed_or_partial_runs],
                     key="select_retry_run_id",
                 )
@@ -637,17 +785,23 @@ with tab_pipeline:
                 if st.button("🔁 Trigger Retry Run", type="secondary", key="btn_trigger_retry"):
                     with st.spinner(f"Retrying run '{selected_retry_id}'..."):
                         try:
+                            t0 = time.perf_counter()
                             retry_res = service.retry_pipeline_run(
                                 selected_retry_id,
                                 failed_inputs_only=failed_only,
                                 persist_db=persist_option,
                             )
+                            measured_dur = time.perf_counter() - t0
                             st.session_state["last_pipeline_result"] = retry_res
                             st.session_state["last_pipeline_error"] = None
+                            st.session_state["last_pipeline_exec_time"] = measured_dur
+                            st.session_state["animate_pipeline_run_id"] = retry_res.execution_id
                             st.rerun()
                         except Exception as retry_err:
                             sanitized_retry_err = redact_sensitive_text(str(retry_err))
                             st.error(f"Retry execution failed: {sanitized_retry_err}")
+        else:
+            st.info("ℹ️ All recent pipeline runs completed successfully (100% success rate). No failed or partial runs require retrying.")
 
     st.caption(
         "🕒 **Automated Scheduling Status:** Recurring daemon/cron execution is deferred in BEACON v1.0.0 MVP. "
@@ -1049,11 +1203,18 @@ with tab_diagnostics:
             for k, v in diag.get("tables", {}).items()
         ]
         st.table(t_data)
+        missing_names = [k for k, v in diag.get("tables", {}).items() if v == -1]
+        if missing_names == ["pipeline_runs"]:
+            upgrade_cmd = "python scripts/migrate_v1_0.py"
+            action_desc = "To apply the additive v1.0 migration for pipeline_runs, run:"
+        else:
+            upgrade_cmd = "python scripts/init_db.py"
+            action_desc = "To initialize the schema, execute the initialization script in your terminal:"
         st.info(
-            "To initialize the schema, execute the initialization script in your terminal:\n\n"
-            "```bash\n"
-            "python scripts/init_db.py\n"
-            "```"
+            f"{action_desc}\n\n"
+            f"```bash\n"
+            f"{upgrade_cmd}\n"
+            f"```"
         )
 
     else:

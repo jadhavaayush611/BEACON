@@ -66,7 +66,40 @@ python scripts/migrate_v0_4.py --url postgresql+psycopg://username:password@loca
 
 ---
 
-## 4. Rollback & Disaster Recovery Guidance
+## 4. Upgrading to Phase 2C / v1.1 Universal Observation Architecture
+
+If an existing database is running with v1.0 schema, apply the additive v1.1 migration to add universal observation type support:
+
+### Dry-Run Inspection
+```bash
+python scripts/migrate_v1_1.py --dry-run
+```
+
+### Applying Migration
+```bash
+python scripts/migrate_v1_1.py --url postgresql+psycopg://username:password@localhost:5435/beacon_test --confirm
+`
+
+> [!IMPORTANT]
+> The --confirm flag is mandatory to execute changes. Without --confirm, the runner aborts with an error to prevent accidental execution. Furthermore, URLs pointing to port 5432 or PricePilot are explicitly blocked by the runner.``
+
+### Schema Changes
+The v1.1 migration adds the following non-breaking, backward-compatible columns and indexes to the `observations` table:
+- `observation_type VARCHAR(32) NOT NULL DEFAULT 'incident'`
+- `is_event_eligible BOOLEAN NOT NULL DEFAULT true`
+- `context_payload JSONB NOT NULL DEFAULT '{}'::jsonb`
+- Drops `NOT NULL` constraint on `event_type` to accommodate context observations.
+- Creates index `ix_observations_observation_type` on `observations(observation_type)`.
+- Creates index `ix_observations_is_event_eligible` on `observations(is_event_eligible)`.
+
+### Compatibility Guarantees & Host Limitations
+- Existing rows are seamlessly preserved with default `observation_type = 'incident'` and `is_event_eligible = true`.
+- Context observations with `event_type = None` are persisted without schema constraint violations.
+- Note: Live PostgreSQL execution of this migration is currently BLOCKED on local host environments without an isolated PostgreSQL instance. It has been verified via SQLite in-memory integration suites.
+
+---
+
+## 5. Rollback & Disaster Recovery Guidance
 
 In the event of an operational need to roll back Phase 4 tables while preserving Phase 3 observations and source records:
 
@@ -87,7 +120,7 @@ COMMIT;
 
 ---
 
-## 5. Automated CI Verification
+## 6. Automated CI Verification
 
 Automated CI executes tests against a real PostgreSQL service container in GitHub Actions:
 - Fresh schema initialization verified via `test_postgres_fresh_initialization_and_batch_persistence`.

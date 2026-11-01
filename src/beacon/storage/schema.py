@@ -62,7 +62,7 @@ class SourceModel(Base):
 
 
 class ObservationModel(Base):
-    """Stores extracted canonical disaster observation records."""
+    """Stores extracted canonical disaster and context observation records."""
 
     __tablename__ = "observations"
 
@@ -73,7 +73,9 @@ class ObservationModel(Base):
         nullable=False,
         index=True,
     )
-    event_type = Column(String(128), nullable=False, index=True)
+    observation_type = Column(String(32), nullable=False, default="incident", server_default="incident", index=True)
+    is_event_eligible = Column(Boolean, nullable=False, default=True, server_default="true", index=True)
+    event_type = Column(String(128), nullable=True, index=True)
     location = Column(Text, nullable=True)
     event_time = Column(DateTime(timezone=True), nullable=True, index=True)
     description = Column(Text, nullable=True)
@@ -84,6 +86,7 @@ class ObservationModel(Base):
     page_number = Column(Integer, nullable=True)
     source_reference = Column(String(512), nullable=True)
     raw_claim = Column(Text, nullable=True)
+    context_payload = Column(JSON, nullable=False, default=dict)
     validation_warnings = Column(JSON, nullable=False, default=list)
     created_at = Column(
         DateTime(timezone=True),

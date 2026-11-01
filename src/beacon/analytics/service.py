@@ -98,11 +98,13 @@ class AnalyticsService:
             ambiguous_count_effective = 0
         else:
             if observations:
-                total_obs = len(observations)
+                # Disaster metrics: calculate compression, missing coords/times using incident observations only
+                incident_obs = [o for o in observations if getattr(o, "is_incident", True)]
+                total_obs = len(incident_obs)
                 obs_missing_coords = sum(
-                    1 for o in observations if o.latitude is None or o.longitude is None
+                    1 for o in incident_obs if o.latitude is None or o.longitude is None
                 )
-                obs_missing_times = sum(1 for o in observations if o.event_time is None)
+                obs_missing_times = sum(1 for o in incident_obs if o.event_time is None)
             else:
                 total_obs = sum(len(e.observation_ids) for e in filtered_events)
                 obs_missing_coords = 0
@@ -272,17 +274,21 @@ class AnalyticsService:
                 ambiguous_count = 0
                 merge_count = 0
         else:
-            # Global unfiltered observation queries
+            # Global unfiltered observation queries: disaster analytics use event-eligible incident observations only
             total_obs = session.execute(
-                select(func.count(distinct(ObservationModel.observation_id)))
+                select(func.count(distinct(ObservationModel.observation_id))).where(
+                    ObservationModel.is_event_eligible.is_(True)
+                )
             ).scalar() or 0
             obs_missing_coords = session.execute(
                 select(func.count(distinct(ObservationModel.observation_id))).where(
+                    ObservationModel.is_event_eligible.is_(True),
                     (ObservationModel.latitude.is_(None)) | (ObservationModel.longitude.is_(None))
                 )
             ).scalar() or 0
             obs_missing_times = session.execute(
                 select(func.count(distinct(ObservationModel.observation_id))).where(
+                    ObservationModel.is_event_eligible.is_(True),
                     ObservationModel.event_time.is_(None)
                 )
             ).scalar() or 0

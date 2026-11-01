@@ -31,7 +31,11 @@ from beacon.storage import (
     StorageRepository,
     init_db,
 )
+from collections import Counter
+import json
 from scripts.migrate_v0_4 import apply_migration
+from scripts.migrate_v1_1 import apply_migration as apply_v1_1_migration
+from beacon.models import ObservationType
 
 TEST_DB_URL = os.getenv("BEACON_TEST_DATABASE_URL")
 REQUIRE_POSTGRES = os.getenv("BEACON_REQUIRE_POSTGRES", "").lower() in ("1", "true", "yes")
@@ -53,12 +57,17 @@ pytestmark = pytest.mark.skipif(
 def pg_disposable_schema():
     """Create an isolated, disposable PostgreSQL schema and return an engine scoped to it."""
     assert TEST_DB_URL is not None
-    root_engine = create_engine(TEST_DB_URL)
+    root_engine = create_engine(TEST_DB_URL, connect_args={"connect_timeout": 3})
 
-    # Test database connectivity
+    # Test database connectivity and strictly assert target is beacon_test, not beacon_dev
     try:
         with root_engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+            current_db = conn.execute(text("SELECT current_database()")).scalar()
+            if current_db != "beacon_test":
+                raise RuntimeError(
+                    f"SAFETY POLICY VIOLATION: Integration tests must target 'beacon_test', "
+                    f"but connected to '{current_db}'! Aborting."
+                )
     except Exception as err:
         root_engine.dispose()
         if REQUIRE_POSTGRES:
@@ -558,3 +567,405 @@ class TestPostgresStorageIntegration:
                 text("SELECT 1 FROM information_schema.schemata WHERE schema_name = 'public'")
             ).scalar()
             assert public_exists == 1
+    def test_postgres_schema_inspection_respects_different_schemas(
+        self, pg_disposable_schema
+    ) -> None:
+        """Verify readiness inspection correctly respects current_schema and isolates different schemas."""
+        engine, factory, schema_a = pg_disposable_schema
+        init_db(engine)
+
+        # Create a second empty disposable schema B
+        schema_b = f"beacon_test_{uuid.uuid4().hex[:10]}"
+        with engine.begin() as conn:
+            conn.execute(text(f"CREATE SCHEMA {schema_b}"))
+
+        engine_b = create_engine(
+            TEST_DB_URL,
+            connect_args={"options": f"-csearch_path={schema_b}"},
+        )
+        factory_b = sessionmaker(bind=engine_b, expire_on_commit=False)
+
+        try:
+            from beacon.config import Settings
+            from beacon.dashboard.services import DashboardService
+
+            # Service pointing to schema B (empty schema) reports uninitialized
+            service_b = DashboardService(
+                settings=Settings(database_url=TEST_DB_URL),
+                session_factory=factory_b,
+            )
+            diag_b = service_b.test_database_connection()
+            assert diag_b["connected"] is True
+            assert diag_b["schema_ready"] is False
+            assert diag_b["status"] == "uninitialized"
+            assert diag_b["ready_tables"] == 0
+
+            # Service pointing to schema A (all 8 tables initialized) reports healthy
+            service_a = DashboardService(
+                settings=Settings(database_url=TEST_DB_URL),
+                session_factory=factory,
+            )
+            diag_a = service_a.test_database_connection()
+            assert diag_a["connected"] is True
+            assert diag_a["schema_ready"] is True
+            assert diag_a["status"] == "healthy"
+            assert diag_a["ready_tables"] == 8
+        finally:
+            engine_b.dispose()
+            with engine.begin() as conn:
+                conn.execute(text(f"DROP SCHEMA IF EXISTS {schema_b} CASCADE"))
+
+    def test_postgres_missing_pipeline_runs_diagnostic_and_in_place_migration(
+        self, pg_disposable_schema
+    ) -> None:
+        """Verify PostgreSQL reports missing pipeline_runs in inspected schema and in-place migration restores readiness."""
+        engine, factory, schema_id = pg_disposable_schema
+        init_db(engine)
+
+        # Drop pipeline_runs to simulate legacy Phase 2E schema in disposable schema
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE pipeline_runs;"))
+
+        from beacon.config import Settings
+        from beacon.dashboard.services import DashboardService
+        from scripts.migrate_v1_0 import apply_migration as apply_v1_0_migration
+
+        service = DashboardService(
+            settings=Settings(database_url=TEST_DB_URL),
+            session_factory=factory,
+        )
+
+        # Check diagnostic guidance on PostgreSQL
+        diag = service.test_database_connection()
+        assert diag["connected"] is True
+        assert diag["schema_ready"] is False
+        assert diag["status"] == "uninitialized"
+        assert diag["tables"]["pipeline_runs"] == -1
+        assert "pipeline_runs" in diag["message"]
+        assert "scripts/migrate_v1_0.py" in diag["message"]
+
+        # Overview correctly falls back to in-memory mode without raising
+        ov = service.get_system_overview()
+        assert ov["is_live_db"] is False
+        assert ov["storage_mode"] == "in_memory"
+        assert ov["uninitialized_db"] is True
+        assert ov["events_count"] == 0
+
+        # Execute migration in-place within the disposable schema
+        apply_v1_0_migration(engine)
+
+        # Re-check on the SAME service instance without stale caching
+        assert service.is_schema_ready is True
+        diag_after = service.test_database_connection()
+        assert diag_after["schema_ready"] is True
+        assert diag_after["status"] == "healthy"
+        assert diag_after["ready_tables"] == 8
+        assert diag_after["tables"]["pipeline_runs"] >= 0
+
+    def test_postgres_v1_1_universal_observation_migration_and_types(
+        self, pg_disposable_schema
+    ) -> None:
+        """Verify v1.1 additive migration against live PostgreSQL disposable schema.
+
+        Validates:
+        - Connection strictly targets beacon_test.
+        - Previous database version schema (v1.0) can be populated with existing observations and events.
+        - v1.1 migration executes cleanly.
+        - New columns (observation_type, is_event_eligible, context_payload) and indexes exist.
+        - Existing rows and IDs are preserved.
+        - Existing incident observations retain INCIDENT classification and event eligibility.
+        - Context observations can be inserted and reloaded.
+        - JSON context payloads survive persistence.
+        - Event associations remain intact.
+        - Transaction rollback behaves correctly on error.
+        - Reload verified using a fresh SQLAlchemy session.
+        """
+        engine, factory, schema_id = pg_disposable_schema
+
+        # 1. Verify connection targets beacon_test
+        with engine.connect() as conn:
+            target_db = conn.execute(text("SELECT current_database()")).scalar()
+            assert target_db == "beacon_test", f"Target DB was {target_db}, expected beacon_test"
+
+        # 2. Initialize full base schema
+        init_db(engine)
+
+        # 3. Alter table back to v1.0 state to simulate legacy database before v1.1 migration
+        with engine.begin() as conn:
+            conn.execute(text("DROP INDEX IF EXISTS ix_observations_observation_type;"))
+            conn.execute(text("DROP INDEX IF EXISTS ix_observations_is_event_eligible;"))
+            conn.execute(text("ALTER TABLE observations DROP COLUMN IF EXISTS observation_type;"))
+            conn.execute(text("ALTER TABLE observations DROP COLUMN IF EXISTS is_event_eligible;"))
+            conn.execute(text("ALTER TABLE observations DROP COLUMN IF EXISTS context_payload;"))
+            conn.execute(text("ALTER TABLE observations ALTER COLUMN event_type SET NOT NULL;"))
+
+        # Verify observations table is in v1.0 state
+        with engine.connect() as conn:
+            cols = [
+                row[0] for row in conn.execute(
+                    text("SELECT column_name FROM information_schema.columns WHERE table_schema = :s AND table_name = 'observations'"),
+                    {"s": schema_id}
+                ).fetchall()
+            ]
+            assert "observation_type" not in cols
+            assert "is_event_eligible" not in cols
+            assert "context_payload" not in cols
+
+        # Populate with representative existing v1.0 incident observation and event
+        obs_id_leg = "obs_legacy_pg_001"
+        evt_id_leg = "evt_legacy_pg_001"
+        src_id_leg = "src_legacy_pg_001"
+
+        with engine.begin() as conn:
+            conn.execute(
+                text("""
+                    INSERT INTO sources (source_id, source_file, source_type, extraction_method, ingested_at, extraction_status, content_hash, raw_content, metadata_json, created_at, updated_at)
+                    VALUES (:s_id, 'legacy_feed.json', 'json', 'json_parse', NOW(), 'success', 'hash123', '{}', '{}'::jsonb, NOW(), NOW())
+                """),
+                {"s_id": src_id_leg}
+            )
+            conn.execute(
+                text("""
+                    INSERT INTO observations (observation_id, source_id, event_type, location, event_time, description, severity, latitude, longitude, extraction_confidence, page_number, source_reference, raw_claim, validation_warnings, created_at, updated_at)
+                    VALUES (:o_id, :s_id, 'flood', 'River District', NOW(), 'Severe river flood', 'severe', 34.05, -118.25, 0.95, 1, 'feed.json:1', '{"event":"flood"}', '[]'::jsonb, NOW(), NOW())
+                """),
+                {"o_id": obs_id_leg, "s_id": src_id_leg}
+            )
+            conn.execute(
+                text("""
+                    INSERT INTO events (event_id, event_type, location, start_time, end_time, summary, severity, resolution_rationale, conflicting_claims, source_ids, metadata_json, created_at, updated_at)
+                    VALUES (:e_id, 'flood', 'River District', NOW(), NULL, 'River flood event', 'severe', 'Resolved from legacy feed', '[]'::jsonb, :src_ids::jsonb, '{}'::jsonb, NOW(), NOW())
+                """),
+                {"e_id": evt_id_leg, "src_ids": json.dumps([src_id_leg])}
+            )
+            conn.execute(
+                text("""
+                    INSERT INTO event_observations (event_id, observation_id, confidence_score, assigned_at)
+                    VALUES (:e_id, :o_id, 0.95, NOW())
+                """),
+                {"e_id": evt_id_leg, "o_id": obs_id_leg}
+            )
+
+        # 4. Apply v1.1 migration
+        apply_v1_1_migration(engine)
+
+        # 5. Verify new columns exist
+        with engine.connect() as conn:
+            cols_after = [
+                row[0] for row in conn.execute(
+                    text("SELECT column_name FROM information_schema.columns WHERE table_schema = :s AND table_name = 'observations'"),
+                    {"s": schema_id}
+                ).fetchall()
+            ]
+            assert "observation_type" in cols_after
+            assert "is_event_eligible" in cols_after
+            assert "context_payload" in cols_after
+
+            # Verify indexes exist
+            indexes = [
+                row[0] for row in conn.execute(
+                    text("SELECT indexname FROM pg_indexes WHERE schemaname = :s AND tablename = 'observations'"),
+                    {"s": schema_id}
+                ).fetchall()
+            ]
+            assert "ix_observations_observation_type" in indexes
+            assert "ix_observations_is_event_eligible" in indexes
+
+        # 6. Verify existing rows and IDs are preserved with defaults
+        repo = StorageRepository()
+        with factory() as session:
+            legacy_obs = repo.get_all_observations(session)
+            assert len(legacy_obs) == 1
+            lo = legacy_obs[0]
+            assert lo.observation_id == obs_id_leg
+            assert lo.observation_type == ObservationType.INCIDENT
+            assert lo.is_event_eligible is True
+            assert lo.is_incident is True
+            assert lo.context_payload == {}
+            assert lo.event_type == "flood"
+
+            # Event association remains intact
+            event_obs = repo.get_observations_for_event(evt_id_leg, session)
+            assert len(event_obs) == 1
+            assert event_obs[0].observation_id == obs_id_leg
+
+        # 7. Insert and reload context observations with JSON payloads using fresh session
+        ctx_meta_id = "obs_ctx_meta_pg_001"
+        ctx_doc_id = "obs_ctx_doc_pg_001"
+        meta_payload = {"title": "PostgreSQL Integration Manifest", "file_count": 7, "nested": {"key": "value"}}
+        doc_payload = {"document_type": "sitrep", "author": "Emergency Command", "sections": ["Overview", "Impact"]}
+
+        ctx_meta = DisasterObservation(
+            observation_id=ctx_meta_id,
+            source_id=src_id_leg,
+            raw_claim="{}",
+            location="HQ Manifest",
+            event_type=None,
+            observation_type=ObservationType.DATASET_METADATA,
+            context_payload=meta_payload,
+        )
+        ctx_doc = DisasterObservation(
+            observation_id=ctx_doc_id,
+            source_id=src_id_leg,
+            raw_claim="{}",
+            location="HQ SitRep",
+            event_type=None,
+            observation_type=ObservationType.DOCUMENT_CONTEXT,
+            context_payload=doc_payload,
+        )
+
+        with factory() as session:
+            repo.save_observations([ctx_meta, ctx_doc], session)
+            session.commit()
+
+        # Fresh session reload verification
+        fresh_session = factory()
+        try:
+            all_reloaded = repo.get_all_observations(fresh_session)
+            assert len(all_reloaded) == 3
+
+            meta_reloaded = next(o for o in all_reloaded if o.observation_id == ctx_meta_id)
+            assert meta_reloaded.observation_type == ObservationType.DATASET_METADATA
+            assert meta_reloaded.is_event_eligible is False
+            assert meta_reloaded.is_incident is False
+            assert meta_reloaded.context_payload == meta_payload
+            assert meta_reloaded.context_payload["nested"]["key"] == "value"
+
+            doc_reloaded = next(o for o in all_reloaded if o.observation_id == ctx_doc_id)
+            assert doc_reloaded.observation_type == ObservationType.DOCUMENT_CONTEXT
+            assert doc_reloaded.is_event_eligible is False
+            assert doc_reloaded.context_payload["sections"] == ["Overview", "Impact"]
+        finally:
+            fresh_session.close()
+
+        # 8. Verify transactional rollback behaves correctly
+        with pytest.raises(IntegrityError):
+            with engine.begin() as conn:
+                conn.execute(text("INSERT INTO observations (observation_id, source_id, event_type) VALUES ('obs_fail', 'nonexistent_src', 'flood');"))
+
+        # Verify no partial rows survived rollback
+        with factory() as session:
+            check_failed = repo.get_all_observations(session)
+            assert not any(o.observation_id == "obs_fail" for o in check_failed)
+
+    def test_postgres_repeat_ingestion_and_event_portfolio_stability(
+        self, pg_disposable_schema
+    ) -> None:
+        """Run the exact seven-file dataset twice using isolated PostgreSQL storage.
+
+        Verifies:
+        - 12 INCIDENT observations.
+        - 1 DATASET_METADATA observation.
+        - 1 DOCUMENT_CONTEXT observation.
+        - 1 IMAGE_CONTEXT observation.
+        - 15 total observations.
+        - Zero additional records after second identical run.
+        - No duplicate IDs.
+        - Event portfolio stability (no unexpected event creation or portfolio growth).
+        """
+        from pathlib import Path
+        from beacon.config import Settings
+        from beacon.dashboard.services import DashboardService
+
+        demo_dir = Path(r"C:\Users\NWNB0000\Downloads\BEACON_MultiFormat_Pipeline_Demo")
+        if not demo_dir.exists():
+            pytest.skip("Demonstration dataset directory not found")
+
+        uploads = [(f.name, f.read_bytes()) for f in sorted(demo_dir.iterdir()) if f.is_file()]
+
+        engine, factory, schema_id = pg_disposable_schema
+        init_db(engine)
+
+        service = DashboardService(
+            settings=Settings(database_url=TEST_DB_URL),
+            session_factory=factory,
+        )
+
+        # Run 1
+        res1 = service.ingest_and_process_uploads(uploads, enable_resolution=True, persist_db=True)
+        obs1 = res1["observations"]
+        events1 = res1["events"]
+
+        assert len(obs1) == 15
+        assert len(events1) == 8
+        counts_1 = Counter(o.observation_type.value for o in obs1)
+        assert counts_1["incident"] == 12
+        assert counts_1["dataset_metadata"] == 1
+        assert counts_1["document_context"] == 1
+        assert counts_1["image_context"] == 1
+
+        repo = StorageRepository()
+        with factory() as session:
+            db_obs_1 = repo.get_all_observations(session)
+            db_events_1 = repo.get_all_events(session)
+            assert len(db_obs_1) == 15
+            assert len(db_events_1) == 8
+            obs_ids_1 = {o.observation_id for o in db_obs_1}
+
+        # Run 2 (repeat ingestion)
+        res2 = service.ingest_and_process_uploads(uploads, enable_resolution=True, persist_db=True)
+        obs2 = res2["observations"]
+        events2 = res2["events"]
+        assert len(obs2) == 15
+        assert len(events2) == 8
+
+        with factory() as session:
+            db_obs_2 = repo.get_all_observations(session)
+            db_events_2 = repo.get_all_events(session)
+            assert len(db_obs_2) == 15, "Repeat ingestion created additional observation rows"
+            assert len(db_events_2) == 8, "Repeat ingestion created unexpected event portfolio growth"
+            obs_ids_2 = {o.observation_id for o in db_obs_2}
+            assert obs_ids_1 == obs_ids_2, "Observation IDs shifted between repeat runs"
+
+    def test_postgres_context_exclusion_from_resolution_and_analytics(
+        self, pg_disposable_schema
+    ) -> None:
+        """Verify context types are excluded from resolution and analytics on PostgreSQL.
+
+        Proves all context types are excluded from clustering, creation, updates, merging,
+        and disaster analytics, while 12 incident observations remain eligible.
+        """
+        from pathlib import Path
+        from beacon.config import Settings
+        from beacon.dashboard.services import DashboardService
+
+        demo_dir = Path(r"C:\Users\NWNB0000\Downloads\BEACON_MultiFormat_Pipeline_Demo")
+        if not demo_dir.exists():
+            pytest.skip("Demonstration dataset directory not found")
+
+        uploads = [(f.name, f.read_bytes()) for f in sorted(demo_dir.iterdir()) if f.is_file()]
+
+        engine, factory, schema_id = pg_disposable_schema
+        init_db(engine)
+
+        service = DashboardService(
+            settings=Settings(database_url=TEST_DB_URL),
+            session_factory=factory,
+        )
+
+        res = service.ingest_and_process_uploads(uploads, enable_resolution=True, persist_db=True)
+        obs_all = res["observations"]
+        events = res["events"]
+
+        # Verify all 12 incident observations are resolved
+        incident_obs = [o for o in obs_all if o.observation_type == ObservationType.INCIDENT]
+        context_obs = [o for o in obs_all if o.observation_type != ObservationType.INCIDENT]
+        assert len(incident_obs) == 12
+        assert len(context_obs) == 3
+
+        # All 12 are event eligible
+        assert all(o.is_event_eligible for o in incident_obs)
+        assert all(not o.is_event_eligible for o in context_obs)
+
+        # No context observations are linked to any event
+        all_linked_obs_ids = {oid for e in events for oid in e.observation_ids}
+        for ctx in context_obs:
+            assert ctx.observation_id not in all_linked_obs_ids
+
+        # Analytics on PostgreSQL excludes context observations
+        analytics = AnalyticsService()
+        with factory() as session:
+            summary = analytics.summarize_db(session)
+            assert summary.total_observations == 12, "Analytics counted context observations"
+            assert summary.total_events == 8
+            assert summary.compression_ratio == 1.5

@@ -55,6 +55,7 @@ class ObservationTransformer:
         return DisasterObservation(
             observation_id=obs.observation_id,
             source_id=obs.source_id,
+            observation_type=obs.observation_type,
             event_type=norm_event_type,
             location=norm_location,
             event_time=obs.event_time,
@@ -66,6 +67,7 @@ class ObservationTransformer:
             page_number=obs.page_number,
             source_reference=obs.source_reference,
             raw_claim=obs.raw_claim,
+            context_payload=dict(obs.context_payload or {}),
             validation_warnings=list(obs.validation_warnings),
         )
 
@@ -83,10 +85,11 @@ class ObservationTransformer:
         return cleaned or None
 
     @staticmethod
-    def normalize_event_type(ev: str) -> str:
+    def normalize_event_type(ev: Optional[str]) -> Optional[str]:
         """Standardize event categories, lowercasing and mapping known aliases."""
+        if ev is None:
+            return None
         cleaned = ev.strip().lower()
-        # Direct alias replacement if recognized
         if cleaned in COMMON_EVENT_ALIASES:
             return COMMON_EVENT_ALIASES[cleaned]
         return cleaned

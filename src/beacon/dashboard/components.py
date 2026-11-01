@@ -510,19 +510,56 @@ button[disabled] {
     box-shadow: 2px 2px 0px #020617 !important;
 }
 
-/* Tables and Dataframes */
+/* Tables and Dataframes: strictly bounded with local horizontal scrolling */
 div[data-testid="stDataFrame"],
-div[data-testid="stTable"] {
+div[data-testid="stTable"],
+.stDataFrame {
     border: 2px solid var(--pixel-border) !important;
     border-radius: 0px !important;
     background-color: var(--pixel-panel) !important;
     box-shadow: 3px 3px 0px #020617 !important;
     overflow-x: auto !important;
+    overflow-y: hidden !important;
+    max-width: 100% !important;
+    width: 100% !important;
+    min-width: 0 !important;
+    box-sizing: border-box !important;
 }
 
 div[data-testid="stDataFrame"]:hover,
 div[data-testid="stTable"]:hover {
     border-color: var(--pixel-border-bright) !important;
+}
+
+div[data-testid="stDataFrame"] > div,
+div[data-testid="stTable"] > div {
+    max-width: 100% !important;
+    min-width: 0 !important;
+    box-sizing: border-box !important;
+}
+
+/* Page and Main Content Layout: Enforce bounded width without page-level horizontal overflow */
+section[data-testid="stMain"] {
+    max-width: 100% !important;
+    overflow-x: clip !important;
+    box-sizing: border-box !important;
+}
+
+div[data-testid="stMainBlockContainer"] {
+    max-width: 100% !important;
+    min-width: 0 !important;
+    box-sizing: border-box !important;
+    overflow-x: clip !important;
+}
+
+div[data-testid="stVerticalBlock"],
+div[data-testid="stElementContainer"],
+div[data-testid="stTabs"],
+div[data-testid="stTabContent"],
+div[data-testid="stHorizontalBlock"] {
+    max-width: 100% !important;
+    min-width: 0 !important;
+    box-sizing: border-box !important;
 }
 
 /* HTML / Native Table Elements */
@@ -846,36 +883,65 @@ div[data-testid="stDateInput"] input {
     background-color: #070c18;
     border: 2px solid var(--pixel-border);
     box-shadow: 3px 3px 0px #020617;
-    padding: 1.15rem 1.35rem;
+    padding: 1.15rem 1.25rem;
     margin: 1rem 0;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    box-sizing: border-box !important;
 }
 
 .beacon-timeline-header {
     font-family: var(--font-pixel-heading);
-    font-size: 0.95rem;
+    font-size: 0.88rem;
     color: var(--pixel-cyan);
-    letter-spacing: 0.06em;
-    margin-bottom: 0.95rem;
-    text-shadow: 0 0 8px rgba(0, 240, 255, 0.4);
+    letter-spacing: 0.05em;
+    margin-bottom: 0.85rem;
+    padding-bottom: 0.5rem;
+    border-bottom: 1px solid var(--pixel-border);
     display: flex;
     justify-content: space-between;
     align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    min-width: 0;
+    text-shadow: 0 0 8px rgba(0, 240, 255, 0.4);
 }
 
 .beacon-stage-row {
     display: flex;
-    align-items: flex-start;
-    gap: 0.85rem;
-    padding: 0.65rem 0.75rem;
-    margin-bottom: 0.45rem;
+    flex-direction: column;
+    gap: 0.45rem;
+    padding: 0.75rem 0.95rem;
+    margin-bottom: 0.55rem;
     background: #0b1120;
     border-left: 3px solid var(--pixel-border);
     transition: all 0.15s ease;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    box-sizing: border-box !important;
 }
 
 .beacon-stage-row:hover {
     background: #0f172a;
     border-left-color: var(--pixel-cyan);
+}
+
+.beacon-stage-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    width: 100%;
+    min-width: 0;
+}
+
+.beacon-stage-title-wrap {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.65rem;
+    flex-wrap: wrap;
+    min-width: 0;
 }
 
 .beacon-stage-badge {
@@ -888,6 +954,7 @@ div[data-testid="stDateInput"] input {
     border: 1px solid;
     box-shadow: 1px 1px 0px #020617;
     white-space: nowrap;
+    flex-shrink: 0;
 }
 
 .stage-completed { background: #064e3b; color: #10b981; border-color: #10b981; }
@@ -903,22 +970,97 @@ div[data-testid="stDateInput"] input {
     font-weight: 700;
     color: #f1f5f9;
     letter-spacing: 0.04em;
-    margin-bottom: 0.2rem;
+    min-width: 0;
+}
+
+.beacon-stage-elapsed {
+    font-family: var(--font-mono);
+    font-size: 0.72rem;
+    color: #38bdf8;
+    background: #082f49;
+    border: 1px solid #0284c7;
+    padding: 0.15rem 0.45rem;
+    white-space: nowrap;
+    margin-left: auto;
+}
+
+.beacon-stage-body {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    width: 100%;
+    min-width: 0;
 }
 
 .beacon-stage-msg {
     font-family: var(--font-mono);
     font-size: 0.8rem;
-    color: #94a3b8;
-    line-height: 1.4;
+    color: #cbd5e1;
+    line-height: 1.5;
+    word-break: break-word;
+    overflow-wrap: anywhere;
+    width: 100%;
+    min-width: 0;
 }
 
 .beacon-stage-metrics {
-    margin-left: auto;
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem 0.5rem;
+    align-items: center;
+    width: 100%;
+    min-width: 0;
+    margin-top: 0.25rem;
+}
+
+.beacon-metric-token {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.2rem 0.5rem;
+    background: #081120;
+    border: 1px solid #1e293b;
+    border-radius: 0px;
+    box-shadow: 1px 1px 0px #020617;
     font-family: var(--font-mono);
-    font-size: 0.75rem;
-    color: var(--pixel-cyan);
+    font-size: 0.72rem;
     white-space: nowrap;
+}
+
+.beacon-metric-token .metric-key {
+    color: #94a3b8;
+    font-weight: 500;
+}
+
+.beacon-metric-token .metric-val {
+    color: var(--pixel-cyan);
+    font-weight: 700;
+}
+
+.beacon-metric-token.metric-token-danger {
+    background: #3b0a0a;
+    border-color: #ef4444;
+}
+
+.beacon-metric-token.metric-token-danger .metric-key {
+    color: #fca5a5;
+}
+
+.beacon-metric-token.metric-token-danger .metric-val {
+    color: #f87171;
+}
+
+.beacon-metric-token.metric-token-warn {
+    background: #3b1c05;
+    border-color: #f59e0b;
+}
+
+.beacon-metric-token.metric-token-warn .metric-key {
+    color: #fef08a;
+}
+
+.beacon-metric-token.metric-token-warn .metric-val {
+    color: #fbbf24;
 }
 
 /* Incident & Observation Cards */
@@ -1280,18 +1422,39 @@ def render_process_timeline(
         elapsed = s.get("elapsed")
         elapsed_str = f"{elapsed:.2f}s" if elapsed is not None else ""
         counts = s.get("counts", {})
-        counts_str = " | ".join(f"{k.replace('_', ' ').title()}: {v}" for k, v in counts.items())
-        meta_str = f"{counts_str} ({elapsed_str})" if elapsed_str else counts_str
 
-        meta_div = f'<div class="beacon-stage-metrics">{meta_str}</div>' if meta_str else ''
+        metrics_tokens = []
+        for k, v in counts.items():
+            label = k.replace("_", " ").title()
+            is_failure_key = any(bad in k.lower() for bad in ["fail", "reject", "invalid", "error"]) and (isinstance(v, int) and v > 0)
+            is_warn_key = any(w in k.lower() for w in ["warn", "partial", "unsupported", "ambiguous"]) and (isinstance(v, int) and v > 0)
+            token_cls = "metric-token"
+            if is_failure_key:
+                token_cls += " metric-token-danger"
+            elif is_warn_key:
+                token_cls += " metric-token-warn"
+            metrics_tokens.append(
+                f'<span class="beacon-metric-token {token_cls}">'
+                f'<span class="metric-key">{label}:</span> '
+                f'<span class="metric-val">{v}</span>'
+                f'</span>'
+            )
+        metrics_html = f'<div class="beacon-stage-metrics">{"".join(metrics_tokens)}</div>' if metrics_tokens else ""
+        elapsed_html = f'<span class="beacon-stage-elapsed">⏱️ {elapsed_str}</span>' if elapsed_str else ""
+
         row_snippet = (
             f'<div class="beacon-stage-row">'
-            f'<span class="beacon-stage-badge {badge_cls}">{icon} {st_val.upper()}</span>'
-            f'<div style="flex: 1 1 auto;">'
-            f'<div class="beacon-stage-title">{name}</div>'
-            f'<div class="beacon-stage-msg">{msg}</div>'
-            f'</div>'
-            f'{meta_div}'
+            f'  <div class="beacon-stage-header">'
+            f'    <div class="beacon-stage-title-wrap">'
+            f'      <span class="beacon-stage-badge {badge_cls}">{icon} {st_val.upper()}</span>'
+            f'      <span class="beacon-stage-title">{name}</span>'
+            f'    </div>'
+            f'    {elapsed_html}'
+            f'  </div>'
+            f'  <div class="beacon-stage-body">'
+            f'    <div class="beacon-stage-msg">{msg}</div>'
+            f'    {metrics_html}'
+            f'  </div>'
             f'</div>'
         )
         rows_html.append(row_snippet)
@@ -1354,7 +1517,11 @@ def render_pipeline_timeline(
             "stage_id": "extract",
             "name": "1. Extract",
             "status": extract_status,
-            "message": f"Extracted {result.observations_extracted} observation(s) across {result.files_discovered} source file(s).",
+            "message": (
+                f"Extracted {result.observations_extracted} observation(s) from {result.files_succeeded} readable file(s) ({result.files_failed} failed)."
+                if result.files_failed > 0
+                else f"Extracted {result.observations_extracted} observation(s) across {result.files_discovered} source file(s)."
+            ),
             "counts": {"succeeded": result.files_succeeded, "failed": result.files_failed},
         },
         {
@@ -1376,21 +1543,32 @@ def render_pipeline_timeline(
             "name": "4. Resolve (Entity Synthesis)",
             "status": resolve_status,
             "message": (
-                f"Synthesized {result.events_synthesized} canonical event(s) "
-                f"({res_summary.get('ambiguous_count', 0)} ambiguous candidates flagged)."
+                f"Resolution complete: {res_summary.get('events_created', getattr(result, 'events_created', 0))} created this run, "
+                f"{res_summary.get('events_updated', getattr(result, 'events_updated', 0))} updated this run "
+                f"({res_summary.get('active_portfolio', getattr(result, 'active_portfolio', result.events_synthesized))} total active in portfolio)."
             ),
-            "counts": {"events": result.events_synthesized, "ambiguous": res_summary.get("ambiguous_count", 0)},
+            "counts": {
+                "created_this_run": res_summary.get("events_created", getattr(result, "events_created", 0)),
+                "updated_this_run": res_summary.get("events_updated", getattr(result, "events_updated", 0)),
+                "active_portfolio": res_summary.get("active_portfolio", getattr(result, "active_portfolio", result.events_synthesized)),
+                "ambiguous_count": res_summary.get("ambiguous_count", 0),
+            },
         },
         {
             "stage_id": "load",
             "name": "5. Load (Persistence)",
             "status": load_status,
             "message": (
-                f"Persisted {result.records_persisted} record(s) and {result.events_persisted} event(s) to PostgreSQL."
+                f"Persisted {result.records_persisted} observation(s) and {res_summary.get('events_persisted_this_run', getattr(result, 'events_persisted_this_run', result.events_persisted))} event(s) this run "
+                f"({res_summary.get('active_portfolio', getattr(result, 'active_portfolio', result.events_persisted))} active events in portfolio) to PostgreSQL."
                 if result.storage_enabled and load_status == "completed"
                 else ("Storage unconfigured: Cached in-memory without persistent DB writes." if not result.storage_enabled else "Persistence failed.")
             ),
-            "counts": {"records_persisted": result.records_persisted, "events_persisted": result.events_persisted},
+            "counts": {
+                "records_persisted": result.records_persisted,
+                "events_persisted_this_run": res_summary.get("events_persisted_this_run", getattr(result, "events_persisted_this_run", result.events_persisted)),
+                "active_portfolio": res_summary.get("active_portfolio", getattr(result, "active_portfolio", result.events_persisted)),
+            },
         },
     ]
 
@@ -1455,7 +1633,7 @@ def render_observation_cards(
     event_map: Optional[dict[str, str]] = None,
     resolution_decisions: Optional[dict[str, dict[str, Any]]] = None,
 ) -> None:
-    """Render readable, expandable incident cards for extracted observations."""
+    """Render readable, expandable incident and context cards for extracted observations."""
     if not observations:
         render_empty_state("NO OBSERVATIONS EXTRACTED", "No disaster observations were extracted from the processed files.")
         return
@@ -1466,22 +1644,29 @@ def render_observation_cards(
     for idx, obs in enumerate(observations):
         event_id = ev_map.get(obs.observation_id)
         decision_info = dec_map.get(obs.observation_id)
+        obs_type_val = obs.observation_type.value if hasattr(obs.observation_type, "value") else str(obs.observation_type)
+        is_inc = getattr(obs, "is_incident", True)
 
         # Build card header
-        sev_html = get_severity_badge_html(obs.severity)
-        if event_id:
-            res_status_html = f'<span class="beacon-badge badge-multi-source">LINKED: {event_id}</span>'
-        elif decision_info and decision_info.get("decision_type") == "ambiguous_candidate":
-            res_status_html = '<span class="beacon-badge badge-conflict">AMBIGUOUS CANDIDATE</span>'
+        if is_inc:
+            sev_html = get_severity_badge_html(obs.severity)
+            if event_id:
+                res_status_html = f'<span class="beacon-badge badge-multi-source">EVENT LINKED: {event_id}</span>'
+            elif decision_info and decision_info.get("decision_type") == "ambiguous_candidate":
+                res_status_html = '<span class="beacon-badge badge-conflict">AMBIGUOUS CANDIDATE</span>'
+            else:
+                res_status_html = '<span class="beacon-badge badge-single-source">STANDALONE INCIDENT</span>'
         else:
-            res_status_html = '<span class="beacon-badge badge-single-source">STANDALONE / RESOLVED</span>'
+            sev_html = f'<span class="beacon-badge badge-neutral">{obs_type_val.upper()}</span>'
+            res_status_html = '<span class="beacon-badge badge-neutral">SUPPORTING CONTEXT (NOT AN EVENT)</span>'
 
-        loc_str = obs.location or "Unknown Location"
-        coords_str = f"({obs.latitude:.4f}, {obs.longitude:.4f})" if (obs.latitude is not None and obs.longitude is not None) else "[No GPS Coordinates]"
-        time_str = obs.event_time.strftime("%Y-%m-%d %H:%M:%S UTC") if obs.event_time else "⚠️ Missing / Unanchored temporal reference"
+        loc_str = obs.location or ("Global / Dataset Scope" if not is_inc else "Unknown Location")
+        coords_str = f"({obs.latitude:.4f}, {obs.longitude:.4f})" if (obs.latitude is not None and obs.longitude is not None) else ("[Context / No Coordinates]" if not is_inc else "[No GPS Coordinates]")
+        time_str = obs.event_time.strftime("%Y-%m-%d %H:%M:%S UTC") if obs.event_time else ("[Context / Unanchored]" if not is_inc else "⚠️ Missing / Unanchored temporal reference")
 
         # Determine expander label
-        label = f"[{obs.event_type.upper()}] {loc_str} — {obs.observation_id} (Source: {obs.source_id})"
+        ev_label = (obs.event_type or obs_type_val).upper()
+        label = f"[{ev_label}] {loc_str} — {obs.observation_id} (Source: {obs.source_id})"
 
         with st.expander(label, expanded=(idx < 3)):
             claim_text = obs.raw_claim or obs.description or ""

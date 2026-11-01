@@ -13,6 +13,7 @@ from beacon.ingestion.result import IngestionResult
 from beacon.models import (
     DisasterObservation,
     ExtractionMethod,
+    ExtractionOutcome,
     ExtractionStatus,
     SourceType,
     generate_observation_id,
@@ -185,23 +186,33 @@ class PdfIngestor(BaseIngestor):
 
         # Check document-level conditions
         if total_pages > 0 and pages_with_text == 0:
+            status = ExtractionStatus.SUCCESS
+            outcome = ExtractionOutcome.DOCUMENT_ANALYZED_NO_OBSERVATIONS
+            explanation = "PDF contains zero extractable text across all pages. Scanned document OCR deferred (Phase 2 boundary)."
             warnings.append(
                 "PDF contains zero extractable text across all pages. "
                 "Scanned document OCR is not performed in Phase 2."
             )
-            status = ExtractionStatus.SUCCESS
         elif processed_count == 0:
             status = ExtractionStatus.SUCCESS
+            outcome = ExtractionOutcome.DOCUMENT_ANALYZED_NO_OBSERVATIONS
+            explanation = f"PDF analysed ({total_pages} page(s)). No structured incident reports identified."
         elif accepted_count > 0 and rejected_count == 0:
             status = ExtractionStatus.SUCCESS
+            outcome = ExtractionOutcome.OBSERVATIONS_EXTRACTED
+            explanation = f"Successfully extracted {accepted_count} canonical disaster observation(s) from {total_pages} PDF page(s)."
         elif accepted_count > 0 and rejected_count > 0:
             status = ExtractionStatus.PARTIAL
+            outcome = ExtractionOutcome.OBSERVATIONS_EXTRACTED
+            explanation = f"Partial extraction: {accepted_count} of {processed_count} pages accepted, {rejected_count} rejected."
             warnings.append(
                 f"Partial ingestion: {accepted_count} of {processed_count} pages accepted, "
                 f"{rejected_count} rejected due to errors."
             )
         else:
             status = ExtractionStatus.FAILED
+            outcome = ExtractionOutcome.EXTRACTION_FAILED
+            explanation = f"All {processed_count} page incident reports failed validation."
             errors.append(f"All {processed_count} page incident reports failed validation.")
 
         source_rec.extraction_status = status
@@ -213,6 +224,9 @@ class PdfIngestor(BaseIngestor):
             source_record=source_rec,
             observations=observations,
             status=status,
+            outcome=outcome,
+            document_metadata={"total_pages": total_pages, "pages_with_text": pages_with_text},
+            explanation=explanation,
             errors=errors,
             warnings=warnings,
             processed_count=processed_count,
@@ -222,14 +236,18 @@ class PdfIngestor(BaseIngestor):
 
     def _parse_page_report(self, text: str, page_num: int) -> Optional[dict]:
         """Extract structured key-value incident fields from a PDF page text."""
-        # Key patterns based on sample_report.pdf
-        incident_id_m = re.search(r"Incident ID:\s*([^\n\r]+)", text, re.IGNORECASE)
-        event_cat_m = re.search(r"Event (?:Category|Type):\s*([^\n\r]+)", text, re.IGNORECASE)
-        time_m = re.search(r"Timestamp:\s*([^\n\r]+)", text, re.IGNORECASE)
-        loc_m = re.search(r"Location:\s*([^\n\r]+)", text, re.IGNORECASE)
+        # Match both standard formal sitreps and concise report schemas
+        incident_id_m = re.search(r"(?:Incident ID|record_id|report_id):\s*([^\n\r]+)", text, re.IGNORECASE)
+        event_cat_m = re.search(r"(?:Event (?:Category|Type)|event_type|incident_type|event):\s*([^\n\r]+)", text, re.IGNORECASE)
+        time_m = re.search(r"(?:Timestamp|event_time|time):\s*([^\n\r]+)", text, re.IGNORECASE)
+        loc_m = re.search(r"(?:Location|place):\s*([^\n\r]+)", text, re.IGNORECASE)
         coords_m = re.search(r"(?:Estimated )?Coordinates:\s*Lat\s*([-\d.]+),\s*Lon\s*([-\d.]+)", text, re.IGNORECASE)
-        sev_m = re.search(r"Severity:\s*([^\n\r]+)", text, re.IGNORECASE)
-        narrative_m = re.search(r"(?:Incident Narrative|Field Summary):\s*(.+?)(?=(?:Cross-Reference|$))", text, re.DOTALL | re.IGNORECASE)
+        sev_m = re.search(r"(?:Severity|severity_level):\s*([^\n\r]+)", text, re.IGNORECASE)
+        narrative_m = re.search(
+            r"(?:Incident Narrative|Field Summary|description|narrative):\s*(.+?)(?=(?:Cross-Reference|\n[A-Za-z_]+:|$))",
+            text,
+            re.DOTALL | re.IGNORECASE,
+        )
 
         if not (incident_id_m or event_cat_m or loc_m):
             return None
@@ -242,6 +260,19 @@ class PdfIngestor(BaseIngestor):
                 lon = float(coords_m.group(2))
             except ValueError:
                 pass
+        else:
+            lat_m = re.search(r"(?:latitude|lat):\s*([-\d.]+)", text, re.IGNORECASE)
+            lon_m = re.search(r"(?:longitude|lon):\s*([-\d.]+)", text, re.IGNORECASE)
+            if lat_m:
+                try:
+                    lat = float(lat_m.group(1))
+                except ValueError:
+                    pass
+            if lon_m:
+                try:
+                    lon = float(lon_m.group(1))
+                except ValueError:
+                    pass
 
         return {
             "incident_id": incident_id_m.group(1).strip() if incident_id_m else None,

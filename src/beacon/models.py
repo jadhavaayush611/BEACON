@@ -47,6 +47,24 @@ class ExtractionStatus(str, Enum):
     FAILED = "failed"
 
 
+class ExtractionOutcome(str, Enum):
+    """Semantic outcome classification for an ingested source file."""
+    OBSERVATIONS_EXTRACTED = "observations_extracted"
+    METADATA_EXTRACTED = "metadata_extracted"
+    DOCUMENT_ANALYZED_NO_OBSERVATIONS = "document_analyzed_no_observations"
+    UNSUPPORTED_CONTENT = "unsupported_content"
+    EXTRACTION_FAILED = "extraction_failed"
+
+
+class ObservationType(str, Enum):
+    """Categorical classification of observation records."""
+    INCIDENT = "incident"
+    DATASET_METADATA = "dataset_metadata"
+    DOCUMENT_CONTEXT = "document_context"
+    IMAGE_CONTEXT = "image_context"
+    IMAGE_INCIDENT = "image_incident"
+
+
 class SeverityLevel(str, Enum):
     """Normalized categorical disaster severity rating."""
     MINOR = "minor"
@@ -123,12 +141,15 @@ def generate_observation_id(
     source_reference: Optional[str] = None,
     raw_claim: Optional[str] = None,
     index: Optional[int] = None,
+    observation_type: Optional[str] = None,
 ) -> str:
     """Generate a deterministic, rerun-stable observation ID.
 
-    Derived from source ID, source-internal locator/reference, and claim content.
+    Derived from source ID, source-internal locator/reference, observation type, and claim content.
     """
     elements = [source_id]
+    if observation_type:
+        elements.append(str(observation_type).strip().lower())
     if source_reference:
         elements.append(source_reference.strip().lower())
     if raw_claim:
@@ -254,8 +275,13 @@ class DisasterObservation(BaseModel):
     source_id: str = Field(
         description="Reference to the originating source document ID",
     )
-    event_type: str = Field(
-        description="Normalized category or extensible disaster event string",
+    observation_type: ObservationType = Field(
+        default=ObservationType.INCIDENT,
+        description="Classification: incident, dataset_metadata, document_context, image_context, image_incident",
+    )
+    event_type: Optional[str] = Field(
+        default=None,
+        description="Normalized category or extensible disaster event string for incident observations",
     )
     location: Optional[str] = Field(
         default=None,
@@ -297,10 +323,29 @@ class DisasterObservation(BaseModel):
         default=None,
         description="Original unparsed text or verbatim claim from the source",
     )
+    context_payload: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Structured context metadata for non-incident observations (manifest, doc sections, image info)",
+    )
     validation_warnings: list[str] = Field(
         default_factory=list,
         description="Non-fatal warnings recorded during ingestion and standardization",
     )
+
+    @property
+    def is_incident(self) -> bool:
+        """Return True if this observation represents a genuine disaster incident eligible for event resolution."""
+        return self.observation_type in (ObservationType.INCIDENT, ObservationType.IMAGE_INCIDENT)
+
+    @property
+    def is_event_eligible(self) -> bool:
+        """Return True if this observation is eligible to participate in disaster event resolution."""
+        return self.is_incident
+
+    @property
+    def is_context(self) -> bool:
+        """Return True if this observation represents non-incident supporting context."""
+        return not self.is_incident
 
     @field_validator("event_time")
     @classmethod
@@ -343,7 +388,20 @@ class DisasterObservation(BaseModel):
 
         warnings = list(data.get("validation_warnings") or [])
 
-        # 1. Handle blank or whitespace-only description
+        # 1. Parse observation_type
+        raw_obs_type = data.get("observation_type", ObservationType.INCIDENT)
+        if isinstance(raw_obs_type, str):
+            try:
+                obs_type = ObservationType(raw_obs_type.lower())
+            except ValueError:
+                obs_type = ObservationType.INCIDENT
+        elif isinstance(raw_obs_type, ObservationType):
+            obs_type = raw_obs_type
+        else:
+            obs_type = ObservationType.INCIDENT
+        data["observation_type"] = obs_type
+
+        # 2. Handle blank or whitespace-only description
         desc = data.get("description")
         if isinstance(desc, str):
             stripped_desc = desc.strip()
@@ -353,17 +411,23 @@ class DisasterObservation(BaseModel):
             else:
                 data["description"] = stripped_desc
 
-        # 2. Handle event_type validation and vocabulary extensibility
+        # 3. Handle event_type validation and vocabulary extensibility
         ev_type = data.get("event_type")
-        if ev_type is not None:
-            if not isinstance(ev_type, str) or not ev_type.strip():
-                raise ValueError("event_type must be a non-empty string.")
+        if obs_type in (ObservationType.INCIDENT, ObservationType.IMAGE_INCIDENT):
+            if ev_type is None or not isinstance(ev_type, str) or not ev_type.strip():
+                raise ValueError("event_type must be a non-empty string for incident observations.")
             norm_type = ev_type.strip().lower()
             data["event_type"] = norm_type
             if norm_type not in STANDARD_EVENT_TYPES:
                 warnings.append(
                     f"Non-standard event category '{norm_type}' accepted as custom extensible type."
                 )
+        else:
+            # Context observations do not have a mandatory disaster event_type
+            if ev_type is not None and isinstance(ev_type, str) and ev_type.strip():
+                data["event_type"] = ev_type.strip().lower()
+            else:
+                data["event_type"] = None
 
         data["validation_warnings"] = warnings
         return data

@@ -6,6 +6,7 @@ event querying, analytics, and database diagnostic services without requiring a 
 
 from collections.abc import Generator
 from datetime import datetime, timedelta, timezone
+import json
 from pathlib import Path
 import pytest
 from sqlalchemy import create_engine
@@ -729,7 +730,7 @@ class TestDashboardService:
 
         # Run pipeline
         res = service.run_pipeline_on_paths(sample_paths, enable_resolution=True, persist_db=False)
-        assert res.observations_accepted == 10
+        assert res.observations_accepted == 11
         assert res.events_synthesized == 7
 
         # Post-run overview must immediately reflect 7 events, 10 observations, and ~1.43x ratio
@@ -737,7 +738,7 @@ class TestDashboardService:
         assert post_overview["events_count"] == 7
         assert post_overview["observations_count"] == 10
         assert post_overview["compression_ratio"] == 1.43
-        assert post_overview["sources_count"] == 4
+        assert post_overview["sources_count"] == 5
 
     def test_required_tables_matches_declarative_schema(self) -> None:
         """Ensure REQUIRED_TABLES dynamically aligns with all Base declarative models."""
@@ -1036,7 +1037,9 @@ class TestDashboardFormatters:
         none_msg = explain_compression_ratio(0, 0, None)
         assert "N/A" in none_msg
 
-    def test_dashboard_formatters_and_app_module_imports(self) -> None:
+    def test_dashboard_formatters_and_app_module_imports(
+        self, isolate_in_memory_dashboard: None
+    ) -> None:
         """Regression test: verify dashboard module and formatters import without ImportError.
 
         Ensures explain_compression_ratio is properly exported from both
@@ -1586,7 +1589,7 @@ class TestDashboardDesignSystem:
 
         # Stage 7: Resolution
         assert stages[6]["status"] == "completed"
-        assert stages[6]["counts"]["events_synthesized"] > 0
+        assert stages[6]["counts"]["active_portfolio"] > 0
 
         # Stage 8: Persistence (in-memory mode)
         assert stages[7]["status"] == "warning"
@@ -1775,3 +1778,701 @@ class TestDashboardDesignSystem:
 
         # Progressive animation mode (with low duration for fast test execution)
         render_pipeline_timeline(mock_result, measured_exec_time=0.035, animate=True, min_presentation_seconds=0.05)
+class TestPipelineReportingAndSchemaReadinessDefects:
+    """Regression tests for Issue A (pipeline metrics reconciliation) and Issue B (schema readiness)."""
+
+    def test_ingest_and_process_uploads_seven_files_two_failures_reconciliation(
+        self, tmp_path: Path
+    ) -> None:
+        """Verify 7-file batch with 2 failures produces consistent, transparent stage metrics and warning reason."""
+        import json
+        service = DashboardService(settings=Settings(database_url=None), session_factory=None)
+
+        # 5 valid files
+        uploads = []
+        for i in range(4):
+            payload = json.dumps([
+                {
+                    "event_type": "flood",
+                    "location": f"Zone {i}",
+                    "event_time": "2026-10-29T10:00:00Z",
+                    "severity": "severe",
+                }
+            ]).encode("utf-8")
+            uploads.append((f"valid_{i}.json", payload))
+
+        uploads.append(("valid_sensor.csv", b"event_type,location\nflood,Zone CSV\n"))
+
+        # 2 failing files (1 syntax error, 1 unsupported format)
+        uploads.append(("corrupt_syntax.json", b"{broken json content"))
+        uploads.append(("unsupported_binary.xyz", b"\x00\xFF\x00"))
+
+        assert len(uploads) == 7
+
+        result = service.ingest_and_process_uploads(
+            uploads,
+            enable_resolution=True,
+            persist_db=False,
+        )
+
+        stages = result["stages"]
+        stage_map = {s["stage_id"]: s for s in stages}
+
+        # Stage 1: Received 7
+        assert stage_map["files_received"]["counts"]["files_received"] == 7
+
+        # Stage 2: Format Recognition & Preflight
+        stg2 = stage_map["validation_integrity"]
+        assert stg2["counts"]["preflight_passed"] == 6
+        assert stg2["counts"]["unsupported_or_empty"] == 1
+        assert stg2["status"] == "warning"
+
+        # Stage 3: Format-Specific Extraction
+        stg3 = stage_map["extraction"]
+        assert stg3["counts"]["files_succeeded"] == 5
+        assert stg3["counts"]["files_failed"] == 2
+        assert stg3["counts"]["observations_extracted"] == 5
+        assert stg3["status"] == "warning"
+        assert "2 file(s) failed extraction" in stg3["message"]
+
+        # Stage 4: Normalization (5 observations from 5 readable files)
+        assert stage_map["normalization"]["counts"]["observations_normalized"] == 5
+
+        # Stage 5: Data Quality (all 5 accepted)
+        assert stage_map["data_quality"]["counts"]["records_accepted"] == 5
+        assert stage_map["data_quality"]["counts"]["records_rejected"] == 0
+
+        # Stage 6: Observation Creation
+        assert stage_map["observation_creation"]["counts"]["observations_ready"] == 5
+
+        # Stage 7: Event Matching & Resolution
+        stg7 = stage_map["event_resolution"]
+        assert stg7["counts"]["created_this_run"] >= 1
+        assert stg7["counts"]["created_this_run"] + stg7["counts"]["updated_this_run"] == 5
+        assert stg7["counts"]["active_portfolio"] >= 1
+        assert "Resolution complete:" in stg7["message"]
+        assert "new event(s) created" in stg7["message"]
+        assert "total active event(s) in portfolio" in stg7["message"]
+
+        # Stage 8: Persistence
+        stg8 = stage_map["persistence"]
+        assert stg8["counts"]["in_memory_cached"] == 5
+
+        # Stage 9: Final Summary
+        stg9 = stage_map["final_summary"]
+        assert stg9["status"] == "warning"
+        assert stg9["counts"]["total_files"] == 7
+        assert stg9["counts"]["files_succeeded"] == 5
+        assert stg9["counts"]["files_failed"] == 2
+        assert stg9["counts"]["observations_accepted"] == 5
+        assert stg9["counts"]["created_this_run"] >= 1
+        assert stg9["counts"]["active_portfolio"] >= 1
+        assert "Partial batch completed with warnings" in stg9["message"]
+        assert "2/7 file(s) failed extraction" in stg9["message"]
+
+    def test_dashboard_service_lazy_session_factory_initialization(
+        self, tmp_path: Path
+    ) -> None:
+        """DashboardService initializes session_factory lazily from Settings.database_url."""
+        from sqlalchemy import create_engine
+        from beacon.storage import init_db
+
+        db_file = tmp_path / "lazy_db.sqlite"
+        db_url = f"sqlite:///{db_file}"
+        engine = create_engine(db_url)
+        init_db(engine)
+
+        service = DashboardService(settings=Settings(database_url=db_url), session_factory=None)
+        assert service.session_factory is not None
+        assert service.is_database_reachable is True
+        assert service.is_schema_ready is True
+        assert service.is_database_connected is True
+
+        diag = service.test_database_connection()
+        assert diag["connected"] is True
+        assert diag["schema_ready"] is True
+        assert diag["status"] == "healthy"
+        assert diag["ready_tables"] == 8
+
+    def test_dashboard_service_missing_pipeline_runs_diagnostic_guidance(
+        self, tmp_path: Path
+    ) -> None:
+        """When pipeline_runs is missing, test_database_connection gives actionable migration guidance."""
+        from sqlalchemy import create_engine, text
+        from beacon.storage import init_db
+
+        db_file = tmp_path / "legacy_schema.sqlite"
+        db_url = f"sqlite:///{db_file}"
+        engine = create_engine(db_url)
+        init_db(engine)
+
+        # Drop only pipeline_runs to simulate legacy Phase 4 schema
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE pipeline_runs;"))
+
+        service = DashboardService(settings=Settings(database_url=db_url), session_factory=None)
+        diag = service.test_database_connection()
+
+        assert diag["connected"] is True
+        assert diag["schema_ready"] is False
+        assert diag["status"] == "uninitialized"
+        assert diag["tables"]["pipeline_runs"] == -1
+        assert "missing: pipeline_runs" in diag["message"]
+        assert "scripts/migrate_v1_0.py" in diag["message"]
+
+
+    def test_dashboard_service_all_eight_tables_present_in_expected_schema(
+        self, tmp_path: Path
+    ) -> None:
+        """Verify all eight required tables in the expected schema evaluate to schema_ready=True."""
+        from sqlalchemy import create_engine
+        from beacon.storage import init_db
+
+        db_file = tmp_path / "all_eight_tables.sqlite"
+        db_url = f"sqlite:///{db_file}"
+        engine = create_engine(db_url)
+        init_db(engine)
+
+        service = DashboardService(settings=Settings(database_url=db_url), session_factory=None)
+        assert service.is_database_reachable is True
+        assert service.is_schema_ready is True
+        assert service.is_database_connected is True
+
+        diag = service.test_database_connection()
+        assert diag["connected"] is True
+        assert diag["schema_ready"] is True
+        assert diag["status"] == "healthy"
+        assert diag["ready_tables"] == 8
+        assert diag["total_tables"] == 8
+        assert all(count >= 0 for count in diag["tables"].values())
+        assert diag["tables"]["pipeline_runs"] >= 0
+
+    def test_dashboard_service_tables_in_different_schema_not_recognized(
+        self, tmp_path: Path
+    ) -> None:
+        """Tables present only in a different schema are not recognized as ready for the target schema."""
+        from sqlalchemy import create_engine, text
+
+        db_main = tmp_path / "main_db.sqlite"
+        db_other = tmp_path / "other_db.sqlite"
+        engine_main = create_engine(f"sqlite:///{db_main}")
+        engine_other = create_engine(f"sqlite:///{db_other}")
+
+        # Initialize all 8 tables in other_db
+        from beacon.storage import init_db
+        init_db(engine_other)
+
+        # In main_db, attach other_db as 'other_schema'
+        with engine_main.begin() as conn:
+            conn.execute(text(f"ATTACH DATABASE '{db_other}' AS other_schema;"))
+
+        # Primary schema (main) has 0 tables, other_schema has 8
+        service = DashboardService(settings=Settings(database_url=f"sqlite:///{db_main}"), session_factory=None)
+        assert service.is_database_reachable is True
+        # In the active primary schema, required tables are missing
+        assert service.is_schema_ready is False
+
+        diag = service.test_database_connection()
+        assert diag["connected"] is True
+        assert diag["schema_ready"] is False
+        assert diag["ready_tables"] == 0
+        assert diag["tables"]["sources"] == -1
+
+    def test_dashboard_service_storage_mode_attribution_and_overview_metrics(
+        self, tmp_path: Path
+    ) -> None:
+        """Verify overview metrics and storage-mode attribution under unconfigured, uninitialized, and initialized states."""
+        from sqlalchemy import create_engine, text
+        from beacon.storage import init_db
+
+        # 1. Unconfigured storage
+        unconf_service = DashboardService(settings=Settings(database_url=None), session_factory=None)
+        unconf_ov = unconf_service.get_system_overview()
+        assert unconf_ov["is_live_db"] is False
+        assert unconf_ov["storage_mode"] == "in_memory"
+        assert unconf_ov["db_connected"] is False
+        assert unconf_ov["schema_ready"] is False
+        assert unconf_ov["uninitialized_db"] is False
+        assert unconf_ov["events_count"] == 0
+
+        # 2. Reachable but uninitialized storage (missing pipeline_runs)
+        db_file = tmp_path / "partially_migrated.sqlite"
+        db_url = f"sqlite:///{db_file}"
+        engine = create_engine(db_url)
+        init_db(engine)
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE pipeline_runs;"))
+
+        uninit_service = DashboardService(settings=Settings(database_url=db_url), session_factory=None)
+        uninit_ov = uninit_service.get_system_overview()
+        assert uninit_ov["is_live_db"] is False
+        assert uninit_ov["storage_mode"] == "in_memory"
+        assert uninit_ov["db_connected"] is True
+        assert uninit_ov["schema_ready"] is False
+        assert uninit_ov["uninitialized_db"] is True
+        assert uninit_ov["events_count"] == 0
+
+        # 3. Fully initialized storage (all 8 tables)
+        full_db_file = tmp_path / "fully_migrated.sqlite"
+        full_db_url = f"sqlite:///{full_db_file}"
+        full_engine = create_engine(full_db_url)
+        init_db(full_engine)
+
+        full_service = DashboardService(settings=Settings(database_url=full_db_url), session_factory=None)
+        full_ov = full_service.get_system_overview()
+        assert full_ov["is_live_db"] is True
+        assert full_ov["storage_mode"] == "postgresql"
+        assert full_ov["db_connected"] is True
+        assert full_ov["schema_ready"] is True
+        assert full_ov["uninitialized_db"] is False
+
+    def test_dashboard_service_prevents_stale_readiness_on_configuration_change(
+        self, tmp_path: Path
+    ) -> None:
+        """DashboardService dynamically refreshes session factory and readiness when Settings.database_url changes."""
+        from sqlalchemy import create_engine, text
+        from beacon.storage import init_db
+
+        # Database A: uninitialized (missing pipeline_runs)
+        db_a = tmp_path / "db_a.sqlite"
+        url_a = f"sqlite:///{db_a}"
+        engine_a = create_engine(url_a)
+        init_db(engine_a)
+        with engine_a.begin() as conn:
+            conn.execute(text("DROP TABLE pipeline_runs;"))
+
+        # Database B: fully initialized (all 8 tables)
+        db_b = tmp_path / "db_b.sqlite"
+        url_b = f"sqlite:///{db_b}"
+        engine_b = create_engine(url_b)
+        init_db(engine_b)
+
+        # Service begins pointing to Database A
+        service = DashboardService(settings=Settings(database_url=url_a), session_factory=None)
+        assert service.is_schema_ready is False
+        diag_a = service.test_database_connection()
+        assert diag_a["schema_ready"] is False
+        assert diag_a["tables"]["pipeline_runs"] == -1
+
+        # Reconfigure service settings to Database B
+        service.settings = Settings(database_url=url_b)
+        assert service.is_schema_ready is True
+        diag_b = service.test_database_connection()
+        assert diag_b["schema_ready"] is True
+        assert diag_b["ready_tables"] == 8
+        assert diag_b["tables"]["pipeline_runs"] >= 0
+
+        # Reconfigure service settings to None (in-memory mode)
+        service.settings = Settings(database_url=None)
+        assert service.is_database_reachable is False
+        assert service.is_schema_ready is False
+        diag_none = service.test_database_connection()
+        assert diag_none["connected"] is False
+        assert diag_none["status"] == "unconfigured"
+    def test_dashboard_service_in_place_migration_clears_readiness_warning_without_restart(
+        self, tmp_path: Path
+    ) -> None:
+        """Applying migration in-place immediately updates is_schema_ready without stale caching."""
+        from sqlalchemy import create_engine, text
+        from beacon.storage import init_db
+        from scripts.migrate_v1_0 import apply_migration as apply_v1_0_migration
+
+        db_file = tmp_path / "in_place_mig.sqlite"
+        db_url = f"sqlite:///{db_file}"
+        engine = create_engine(db_url)
+        init_db(engine)
+
+        with engine.begin() as conn:
+            conn.execute(text("DROP TABLE pipeline_runs;"))
+
+        service = DashboardService(settings=Settings(database_url=db_url), session_factory=None)
+        assert service.is_schema_ready is False
+        diag = service.test_database_connection()
+        assert diag["schema_ready"] is False
+        assert diag["status"] == "uninitialized"
+
+        # Apply migration in-place to database file
+        apply_v1_0_migration(engine)
+
+        # Check that SAME service instance dynamically reflects readiness
+        assert service.is_schema_ready is True
+        diag_after = service.test_database_connection()
+        assert diag_after["schema_ready"] is True
+        assert diag_after["status"] == "healthy"
+        assert diag_after["ready_tables"] == 8
+
+class TestTimelineAndLayoutResponsiveness:
+    """Regression tests for timeline stage layout, metric token wrapping, and overflow containment."""
+
+    def test_stage_card_responsive_structure_and_no_fixed_widths(self) -> None:
+        """Stage cards generate header, full-width body, and wrapped metric token containers."""
+        from unittest.mock import MagicMock
+        from beacon.dashboard.components import render_process_timeline
+
+        mock_placeholder = MagicMock()
+        stages = [
+            {
+                "stage_id": "extraction",
+                "name": "3. Format-Specific Extraction",
+                "status": "warning",
+                "message": "Extracted 5 raw observation(s) from 5 readable file(s); 2 file(s) failed extraction due to malformed payload syntax.",
+                "counts": {
+                    "observations_extracted": 5,
+                    "files_succeeded": 5,
+                    "files_failed": 2,
+                    "files_partial": 1,
+                },
+                "elapsed": 0.045,
+            }
+        ]
+
+        render_process_timeline(stages, title="Extraction Process", placeholder=mock_placeholder)
+        assert mock_placeholder.markdown.called
+        rendered_html = mock_placeholder.markdown.call_args[0][0]
+
+        # Verify structural containers
+        assert "beacon-timeline-container" in rendered_html
+        assert "beacon-stage-row" in rendered_html
+        assert "beacon-stage-header" in rendered_html
+        assert "beacon-stage-title-wrap" in rendered_html
+        assert "beacon-stage-badge stage-warning" in rendered_html
+        assert "beacon-stage-title" in rendered_html
+        assert "beacon-stage-elapsed" in rendered_html
+        assert f"{0.045:.2f}s" in rendered_html
+        assert "beacon-stage-body" in rendered_html
+        assert "beacon-stage-msg" in rendered_html
+        assert "Extracted 5 raw observation(s)" in rendered_html
+        assert "beacon-stage-metrics" in rendered_html
+
+        # Verify individual metric tokens
+        assert "beacon-metric-token" in rendered_html
+        assert "Observations Extracted:" in rendered_html
+        assert "Files Succeeded:" in rendered_html
+        # Verify failure token has danger accent class
+        assert "metric-token-danger" in rendered_html
+        assert "Files Failed:" in rendered_html
+        # Verify partial token has warning accent class
+        assert "metric-token-warn" in rendered_html
+        assert "Files Partial:" in rendered_html
+
+    def test_final_summary_and_long_metrics_wrap_without_overflow(self) -> None:
+        """Stage 9 final summary renders full-width paragraph and wraps all 7 metric counters cleanly."""
+        from unittest.mock import MagicMock
+        from beacon.dashboard.components import render_process_timeline
+
+        mock_placeholder = MagicMock()
+        summary_msg = (
+            "Partial batch completed with warnings in 0.052s [2/7 file(s) failed extraction; 1 observation(s) rejected by DQ audit]: "
+            "5 succeeded, 2 failed of 7 file(s). 5 valid observation(s) accepted from readable files; "
+            "4 total active event(s) in portfolio."
+        )
+        stages = [
+            {
+                "stage_id": "final_summary",
+                "name": "9. Final Summary",
+                "status": "warning",
+                "message": summary_msg,
+                "counts": {
+                    "total_files": 7,
+                    "files_succeeded": 5,
+                    "files_failed": 2,
+                    "observations_accepted": 5,
+                    "created_this_run": 4,
+                    "updated_this_run": 0,
+                    "active_portfolio": 4,
+                },
+                "elapsed": 0.052,
+            }
+        ]
+
+        render_process_timeline(stages, title="Final Run Summary", placeholder=mock_placeholder)
+        rendered_html = mock_placeholder.markdown.call_args[0][0]
+
+        # Verify summary description is unabridged and within full-width message block
+        assert summary_msg in rendered_html
+        assert "beacon-stage-msg" in rendered_html
+
+        # Verify all 7 metric tokens are present as distinct wrapped elements
+        for label, val in [
+            ("Total Files:", "7"),
+            ("Files Succeeded:", "5"),
+            ("Files Failed:", "2"),
+            ("Observations Accepted:", "5"),
+            ("Created This Run:", "4"),
+            ("Updated This Run:", "0"),
+            ("Active Portfolio:", "4"),
+        ]:
+            assert label in rendered_html
+            assert val in rendered_html
+
+    def test_overflow_containment_and_local_table_scrolling_css(self) -> None:
+        """Verify CSS design system eliminates horizontal page overflow and bounds tables locally."""
+        from beacon.dashboard.components import DASHBOARD_CSS
+
+        # Verify timeline container constraints
+        assert ".beacon-timeline-container {" in DASHBOARD_CSS
+        assert "max-width: 100% !important;" in DASHBOARD_CSS
+        assert "box-sizing: border-box !important;" in DASHBOARD_CSS
+
+        # Verify stage row uses flex column layout for full-width message placement
+        assert ".beacon-stage-row {" in DASHBOARD_CSS
+        assert "flex-direction: column;" in DASHBOARD_CSS
+
+        # Verify metrics row wraps rather than forcing single-line nowrap
+        assert ".beacon-stage-metrics {" in DASHBOARD_CSS
+        assert "flex-wrap: wrap;" in DASHBOARD_CSS
+
+        # Verify message uses safe word breaking and wrapping
+        assert ".beacon-stage-msg {" in DASHBOARD_CSS
+        assert "word-break: break-word;" in DASHBOARD_CSS
+        assert "overflow-wrap: anywhere;" in DASHBOARD_CSS
+
+        # Verify tables and dataframes are locally scrollable and strictly bounded
+        assert 'div[data-testid="stDataFrame"]' in DASHBOARD_CSS
+        assert "overflow-x: auto !important;" in DASHBOARD_CSS
+        assert "overflow-y: hidden !important;" in DASHBOARD_CSS
+
+        # Verify main container prevents horizontal page overflow
+        assert 'section[data-testid="stMain"]' in DASHBOARD_CSS
+        assert "overflow-x: clip !important;" in DASHBOARD_CSS
+
+    def test_repeat_ingestion_preserves_count_stability_and_clarifies_metrics(
+        self, tmp_path: Path
+    ) -> None:
+        """Verify repeat ingestion of identical 7-file batch preserves idempotency and count stability.
+
+        Run 1 (initial): creates new events, reports active portfolio.
+        Run 2 (repeat): created_this_run == 0, updated_this_run == 7, active_portfolio strictly unchanged.
+        Confirms partial batch messaging explicitly accounts for 2 failed files and 7 accepted observations.
+        """
+        import json
+        from sqlalchemy import create_engine, select
+        from beacon.storage import init_db
+        from beacon.storage.schema import EventModel
+
+        db_file = tmp_path / "idempotent_test.sqlite"
+        db_url = f"sqlite:///{db_file}"
+        engine = create_engine(db_url)
+        init_db(engine)
+
+        service = DashboardService(settings=Settings(database_url=db_url), session_factory=None)
+
+        # 5 valid files yielding 7 observations
+        # File 1: 2 observations (flood)
+        f1_data = json.dumps([
+            {"event_type": "flood", "location": "Sector Alpha", "event_time": "2026-10-29T10:00:00Z", "severity": "severe"},
+            {"event_type": "flood", "location": "Sector Beta", "event_time": "2026-10-29T10:30:00Z", "severity": "moderate"},
+        ]).encode("utf-8")
+        # File 2: 2 observations (wildfire)
+        f2_data = json.dumps([
+            {"event_type": "wildfire", "location": "Ridge Alpha", "event_time": "2026-10-29T11:00:00Z", "severity": "high"},
+            {"event_type": "wildfire", "location": "Ridge Beta", "event_time": "2026-10-29T11:30:00Z", "severity": "critical"},
+        ]).encode("utf-8")
+        # File 3: 1 observation (csv)
+        f3_data = b"event_type,location,event_time,severity\nearthquake,Zone Centroid,2026-10-29T12:00:00Z,severe\n"
+        # File 4: 1 observation (csv)
+        f4_data = b"event_type,location,event_time,severity\nhurricane,Coastal District,2026-10-29T13:00:00Z,severe\n"
+        # File 5: 1 observation (sensor csv)
+        f5_data = b"event_type,location,event_time,severity\ntsunami,Harbor Station,2026-10-29T14:00:00Z,critical\n"
+
+        # 2 failing files
+        f6_fail = b"{malformed json content"
+        f7_fail = b"\x00\x01\x02\xFF\xFE"
+
+        batch_files = [
+            ("events_1.json", f1_data),
+            ("events_2.json", f2_data),
+            ("sensor.csv", f3_data),
+            ("notes.csv", f4_data),
+            ("harbor.csv", f5_data),
+            ("corrupt.json", f6_fail),
+            ("binary.xyz", f7_fail),
+        ]
+        assert len(batch_files) == 7
+
+        # --- RUN 1 (Initial Ingestion) ---
+        res1 = service.ingest_and_process_uploads(
+            batch_files,
+            enable_resolution=True,
+            persist_db=True,
+        )
+        stage_map_1 = {s["stage_id"]: s for s in res1["stages"]}
+
+        # Verify Stage 3 extraction: 5 succeeded, 2 failed
+        assert stage_map_1["extraction"]["counts"]["files_succeeded"] == 5
+        assert stage_map_1["extraction"]["counts"]["files_failed"] == 2
+        assert stage_map_1["extraction"]["counts"]["observations_extracted"] == 7
+
+        # Verify Stage 7 resolution
+        stg7_1 = stage_map_1["event_resolution"]
+        created_1 = stg7_1["counts"]["created_this_run"]
+        updated_1 = stg7_1["counts"]["updated_this_run"]
+        active_1 = stg7_1["counts"]["active_portfolio"]
+        assert created_1 >= 1
+        assert active_1 == created_1
+
+        # Verify Stage 8 persistence
+        stg8_1 = stage_map_1["persistence"]
+        assert stg8_1["status"] == "completed"
+        assert stg8_1["counts"]["records_persisted"] == 7
+        assert stg8_1["counts"]["events_persisted_this_run"] == created_1
+        assert stg8_1["counts"]["active_portfolio"] == active_1
+
+        # Verify Stage 9 final summary
+        stg9_1 = stage_map_1["final_summary"]
+        assert stg9_1["status"] == "warning"
+        assert stg9_1["counts"]["total_files"] == 7
+        assert stg9_1["counts"]["files_succeeded"] == 5
+        assert stg9_1["counts"]["files_failed"] == 2
+        assert stg9_1["counts"]["observations_accepted"] == 7
+        assert stg9_1["counts"]["created_this_run"] == created_1
+        assert stg9_1["counts"]["updated_this_run"] == updated_1
+        assert stg9_1["counts"]["active_portfolio"] == active_1
+        assert "2 of 7 file(s) failed extraction" in stg9_1["message"]
+        assert "7 valid observation(s) were accepted" in stg9_1["message"]
+
+        # Check DB row count after Run 1
+        with service.session_factory() as session:
+            db_events_1 = session.execute(select(EventModel)).scalars().all()
+            assert len(db_events_1) == active_1
+
+        # --- RUN 2 (Exact Repeat Ingestion) ---
+        res2 = service.ingest_and_process_uploads(
+            batch_files,
+            enable_resolution=True,
+            persist_db=True,
+        )
+        stage_map_2 = {s["stage_id"]: s for s in res2["stages"]}
+
+        # Verify Stage 7 resolution on repeat run: 0 created, 7 updated, active portfolio strictly identical
+        stg7_2 = stage_map_2["event_resolution"]
+        assert stg7_2["counts"]["created_this_run"] == 0
+        assert stg7_2["counts"]["updated_this_run"] == 7
+        assert stg7_2["counts"]["active_portfolio"] == active_1
+
+        # Verify Stage 8 persistence on repeat run
+        stg8_2 = stage_map_2["persistence"]
+        assert stg8_2["counts"]["records_persisted"] == 7
+        assert stg8_2["counts"]["events_persisted_this_run"] == active_1
+        assert stg8_2["counts"]["active_portfolio"] == active_1
+
+        # Verify Stage 9 final summary on repeat run
+        stg9_2 = stage_map_2["final_summary"]
+        assert stg9_2["counts"]["created_this_run"] == 0
+        assert stg9_2["counts"]["updated_this_run"] == 7
+        assert stg9_2["counts"]["active_portfolio"] == active_1
+        assert "2 of 7 file(s) failed extraction" in stg9_2["message"]
+
+        # Verify DB row count after Run 2 has NOT drifted
+        with service.session_factory() as session:
+            db_events_2 = session.execute(select(EventModel)).scalars().all()
+            assert len(db_events_2) == active_1
+            # IDs must be completely identical
+            ids_1 = {e.event_id for e in db_events_1}
+            ids_2 = {e.event_id for e in db_events_2}
+            assert ids_1 == ids_2
+
+    def test_streamlit_rerun_does_not_accumulate_or_duplicate_counters(
+        self, tmp_path: Path
+    ) -> None:
+        """Verify cached ingestion metrics in st.session_state are stable across Streamlit rerun cycles."""
+        from unittest.mock import MagicMock
+        from beacon.dashboard.components import render_process_timeline
+
+        mock_session_state = {}
+        service = DashboardService(settings=Settings(database_url=None), session_factory=None)
+
+        uploads = [
+            ("events.json", b'[{"event_type": "flood", "location": "District 1", "event_time": "2026-10-29T10:00:00Z"}]'),
+            ("bad.xyz", b"\x00\xFF"),
+        ]
+
+        # Initial execution
+        ingest_data = service.ingest_and_process_uploads(uploads, enable_resolution=True, persist_db=False)
+        mock_session_state["last_ingestion_data"] = ingest_data
+
+        # Simulate 3 consecutive Streamlit reruns reading from session state
+        for _ in range(3):
+            cached = mock_session_state.get("last_ingestion_data")
+            assert cached is not None
+            stg_map = {s["stage_id"]: s for s in cached["stages"]}
+
+            # Assert counters do not drift or accumulate
+            assert stg_map["files_received"]["counts"]["files_received"] == 2
+            assert stg_map["extraction"]["counts"]["files_succeeded"] == 1
+            assert stg_map["extraction"]["counts"]["files_failed"] == 1
+            assert stg_map["data_quality"]["counts"]["records_accepted"] == 1
+            assert stg_map["event_resolution"]["counts"]["created_this_run"] == 1
+            assert stg_map["event_resolution"]["counts"]["updated_this_run"] == 0
+            assert stg_map["event_resolution"]["counts"]["active_portfolio"] == 1
+
+            # Render to mock placeholder
+            mock_ph = MagicMock()
+            render_process_timeline(cached["stages"], placeholder=mock_ph)
+            rendered_html = mock_ph.markdown.call_args[0][0]
+            assert "Created This Run:</span> <span class=\"metric-val\">1</span>" in rendered_html
+            assert "Active Portfolio:</span> <span class=\"metric-val\">1</span>" in rendered_html
+
+    def test_seven_file_demonstration_batch_ingestion(self, tmp_path: Path) -> None:
+        """Verify the standard 7-file demonstration batch succeeds with 0 extraction failures."""
+        demo_dir = Path(r"C:\Users\NWNB0000\Downloads\BEACON_MultiFormat_Pipeline_Demo")
+        service = DashboardService(settings=Settings(database_url=None), session_factory=None)
+
+        if demo_dir.exists():
+            filenames = sorted([f for f in demo_dir.iterdir() if f.is_file()])
+            uploads = [(f.name, f.read_bytes()) for f in filenames]
+        else:
+            # Fallback synthetic demo batch
+            manifest = json.dumps({
+                "dataset_name": "Demo",
+                "dataset_version": "1.0.0",
+                "files": [{"file": "events.csv"}],
+            }).encode()
+            readme = b"BEACON DEMO\n===========\nReferenced: events.csv"
+            events_json = json.dumps({
+                "events": [{"record_id": "J1", "event_type": "flood", "location": "Loc A", "event_time": "2026-10-27T08:00:00Z"}]
+            }).encode()
+            events_csv = b"record_id,event_type,location,timestamp\nC1,flood,Loc B,2026-10-27T08:00:00Z"
+            events_txt = b"[REPORT]\nrecord_id: T1\nevent_type: flood\nlocation: Loc C\ntimestamp: 2026-10-27T08:00:00Z"
+            uploads = [
+                ("manifest.json", manifest),
+                ("README_DEMO.txt", readme),
+                ("events.json", events_json),
+                ("events.csv", events_csv),
+                ("events.txt", events_txt),
+            ]
+
+        ingest_data = service.ingest_and_process_uploads(uploads, enable_resolution=True, persist_db=False)
+        stages = {s["stage_id"]: s for s in ingest_data["stages"]}
+
+        assert stages["files_received"]["counts"]["files_received"] == len(uploads)
+        assert stages["extraction"]["counts"]["files_failed"] == 0
+        assert stages["extraction"]["counts"]["files_succeeded"] == len(uploads)
+
+        # Check outcomes of results
+        for r in ingest_data["ingestion_results"]:
+            fn = Path(r.source_record.source_file).name
+            assert len(r.observations) >= 1  # Every supported file yields at least one observation
+            if fn == "manifest.json":
+                assert r.outcome.value == "metadata_extracted"
+                assert r.observations[0].observation_type.value == "dataset_metadata"
+            elif fn == "incident_image.png":
+                assert r.outcome.value == "metadata_extracted"
+                assert r.observations[0].observation_type.value == "image_context"
+            elif fn == "README_DEMO.txt":
+                assert r.outcome.value == "document_analyzed_no_observations"
+                assert r.observations[0].observation_type.value == "document_context"
+            elif fn in ("events.csv", "events.json", "events.txt", "sample_report.pdf"):
+                assert r.outcome.value == "observations_extracted"
+                assert all(o.observation_type.value == "incident" for o in r.observations)
+
+        # If full 7-file batch, verify exact counts
+        if len(uploads) == 7:
+            # 12 incident observations + 3 context observations = 15 total observations
+            assert len(ingest_data["observations"]) == 15
+            assert stages["observation_creation"]["counts"]["observations_ready"] == 15
+            assert stages["observation_creation"]["counts"]["incident_observations"] == 12
+            assert stages["observation_creation"]["counts"]["context_observations"] == 3
+            # Active portfolio must match the synthesized disaster events (8 consolidated events from 12 incident observations; context records do NOT create disaster events)
+            assert stages["event_resolution"]["counts"]["active_portfolio"] == 8
+            assert len(ingest_data["events"]) == 8

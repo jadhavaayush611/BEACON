@@ -161,11 +161,11 @@ Copy-Item .env.example .env
 pytest -v
 ```
 
-The 301 unit, contract, end-to-end, and dashboard tests run completely locally without requiring external APIs, PostgreSQL, or OCR binaries. The 6 PostgreSQL integration tests require a configured isolated test database and are skipped when `BEACON_TEST_DATABASE_URL` is unset to prevent modifying development or shared database instances.
+The 372 unit, contract, end-to-end, and dashboard tests run completely locally without requiring external APIs, PostgreSQL, or OCR binaries. The 11 live PostgreSQL integration tests require a configured isolated test database and are safely skipped when `BEACON_TEST_DATABASE_URL` is unset or unavailable to prevent modifying development or shared database instances (383 total collected tests, 372 passed, 11 skipped).
 
-To run the complete 305-test suite against a live PostgreSQL database:
+To run the complete test suite against an isolated test PostgreSQL database when available:
 ```powershell
-$env:BEACON_TEST_DATABASE_URL = "postgresql+psycopg://username:password@localhost:5432/beacon_test"
+$env:BEACON_TEST_DATABASE_URL = "postgresql+psycopg://<username>:<password>@<host>:<port>/beacon_test"
 $env:BEACON_REQUIRE_POSTGRES = "1"
 pytest -v
 ```
@@ -208,8 +208,11 @@ python scripts/init_db.py --url postgresql+psycopg://username:password@localhost
 # 2. Additive Migration from Phase 3 to Phase 4 / v1.0
 python scripts/migrate_v0_4.py --url postgresql+psycopg://username:password@localhost:5432/beacon
 
+# 3. Additive Migration for Universal Observation Architecture (v1.1)
+python scripts/migrate_v1_1.py --url postgresql+psycopg://username:password@localhost:5435/beacon --confirm
+
 # Inspect migration SQL without applying changes
-python scripts/migrate_v0_4.py --dry-run
+python scripts/migrate_v1_1.py --dry-run
 ```
 
 For detailed migration, isolation, and rollback guidance, see [docs/database_migration.md](docs/database_migration.md).
@@ -218,10 +221,29 @@ For detailed migration, isolation, and rollback guidance, see [docs/database_mig
 
 ## Known System Boundaries & Explicit Limitations
 
+> [!WARNING]
+> **PostgreSQL Integration Testing Status (BLOCKED on Host):**
+> Live PostgreSQL integration tests are currently **BLOCKED** by unavailable isolated host infrastructure. The legacy service on port 5435 is offline, host Docker Desktop is intentionally stopped to safeguard sibling production services (PricePilot on port 5432 and Redis on 6379/6380), and no independent PostgreSQL binary installation is available on the host. In-memory SQLite repository tests, migration syntax, and rollback verifications have fully passed (372 passed, 11 skipped), but live PostgreSQL schema compatibility and transactional execution have not yet been independently verified against an isolated live PostgreSQL server.
+
+> [!NOTE]
+> **Universal Observation Architecture (v1.1):**
+> Observations are classified into `INCIDENT`, `IMAGE_INCIDENT`, `DATASET_METADATA`, `DOCUMENT_CONTEXT`, and `IMAGE_CONTEXT`:
+> - **Incident Observations (`is_event_eligible=True`):** Normal disaster reports that participate in multi-attribute blocking, spatiotemporal clustering, event synthesis, and disaster analytics.
+> - **Context Observations (`is_event_eligible=False`):** Metadata, documentation, and image context payloads that are strictly excluded from event clustering, event creation, event updates, event merging, and disaster analytics. They retain full source provenance, SHA-256 integrity, data quality auditing, and JSON payload persistence.
+
+> [!NOTE]
+> **Demonstration Batch Workflow & Verification:**
+> Processing the standard 7-file multi-format demonstration batch (`events.csv`, `events.json`, `events.txt`, `sample_report.pdf`, `incident_image.png`, `manifest.json`, `README_DEMO.txt`) yields exactly 15 total observations:
+> - 12 `INCIDENT` observations (resolving into 8 canonical disaster events)
+> - 1 `DATASET_METADATA` observation
+> - 1 `DOCUMENT_CONTEXT` observation
+> - 1 `IMAGE_CONTEXT` observation
+> Repeat execution of the identical batch is strictly idempotent: 0 duplicate observations, 0 duplicate events, and stable entity identifiers.
+
 > [!NOTE]
 
-> **Supported Formats & OCR Limitations:**
-> BEACON natively ingests JSON telemetry streams, CSV sensor logs, structured TXT dispatches, multi-page PDF documents (`pypdf`), and raster imagery (`Pillow`). For raster imagery, image dimensions and format integrity are verified; OCR via `pytesseract` is evaluated only if optional OCR binary dependencies are installed, otherwise OCR is gracefully deferred/skipped without fabricating data.
+> **Supported Formats & Explicit OCR Boundary:**
+> BEACON natively ingests JSON telemetry streams, CSV sensor logs, structured TXT dispatches, multi-page PDF documents (`pypdf`), and raster imagery in PNG and JPEG formats (`Pillow`). For raster imagery, Pillow performs format validation, dimensional geometry extraction, and container integrity checks. Optical Character Recognition (OCR) and computer-vision text extraction are explicitly deferred and not executed in the v1.0.0 MVP. Image sources produce zero fabricated observation records and emit explicit OCR deferral warnings.
 
 > [!NOTE]
 > **Resolution Thresholds & Ambiguity Management:**
@@ -251,7 +273,7 @@ A fresh developer can clone the repository, run tests, and explore the complete 
 
 ### 1. Setup and Verify Tests
 ```powershell
-# Activate virtual environment and run the test suite (301 passed, 6 live PostgreSQL-only tests safely skipped)
+# Activate virtual environment and run the test suite (324 passed, 14 safely skipped: 8 sandboxed socket tests + 6 live DB tests)
 .\.venv\Scripts\Activate.ps1
 pytest -rs tests
 ```
